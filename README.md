@@ -25,10 +25,12 @@
 3. **命令行唤起与即用即走**：
    用户选择对应身份后，工具通过系统命令行直接调起 Chrome 对应的 Profile 窗口打开目标链接，随后立即退出自身，不常驻后台占用系统资源：
    ```bash
-   open -n -a "Google Chrome" --args --profile-directory="<ProfileDir>" "<TargetURL>"
+   open -n -b com.google.Chrome --args --profile-directory="<ProfileDir>" "<TargetURL>"
    ```
-4. **快速操作**：
-   弹窗展示目标 URL 域名，支持直接按数字键 `1`–`9` 快速以对应身份秒开，或使用方向键配合回车，按 `Esc` 退出。支持深色、浅色及跟随系统三段切换。
+4. **轻量浮层与快速操作**：
+   使用 480×440 的原生磨砂面板展示目标域名与账号列表；左上角关闭按钮、`Esc` 或 `⌘Q` 可随时退出。数字键 `1`–`9` 直接打开，上下键选择相邻账号，左右键循环选择，回车确认；超过可见范围时自动滚动到选中项，静止的鼠标不会覆盖键盘选择。
+5. **外观与反馈**：
+   支持系统、浅色、深色三种外观。背景轻度透明，文字保持不透明；短促淡入、颜色过渡和按压弹簧不阻塞操作，跟随系统减少动态效果，高对比模式使用实色背景。新图标以蓝色分流路径与青绿色身份入口表示链接分流，`resources/icon.svg` 为源，`icon.png` 由 MyGo 自动转换为 ICNS。
 
 ---
 
@@ -48,6 +50,16 @@ cd chrome-profile-router
 # 一键编译并安装至 /Applications/Chrome Profile Router.app
 ./build.sh
 ```
+
+脚本自动选择 Apple Silicon 或 Intel 的本机架构，先在 `/Applications` 内暂存并校验新应用的签名，再替换现有版本；复制、验签或注册失败时保留或恢复旧版本。构建产物位于 `build/darwin-arm64/` 或 `build/darwin-amd64/`。
+
+仅构建、不安装：
+
+```bash
+go run github.com/egoist/mygo/cmd/mygo build -skip-dmg -platform darwin/arm64,darwin/amd64
+```
+
+本地校验使用 `go test ./...`、`go vet ./...` 和 `bash -n build.sh`；macOS CI 执行这些检查并打包两种架构。
 
 ### 设为默认浏览器
 

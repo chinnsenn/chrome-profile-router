@@ -1,3 +1,7 @@
+// [INPUT]: 依赖 Chrome 的 Local State、MyGo 应用/窗口 API，以及 view.go 的渲染入口。
+// [OUTPUT]: 提供 Profile 发现、链接请求队列、Chrome 启动与退出的唯一实现，并创建窗口。
+// [POS]: 根包的状态与路由层；界面在 view.go，配色与动效在 view_style.go。
+// [PROTOCOL]: 变更时更新此头部，然后检查 AGENTS.md
 package main
 
 import (
@@ -17,7 +21,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/egoist/mygo"
-	"github.com/egoist/mygo/plugins/glass"
 	"github.com/egoist/mygo/ui"
 )
 
@@ -94,12 +97,27 @@ type selectorApp struct {
 	launching   bool
 	launchError string
 
-	// revealChosen 表示"本帧需要把选中卡片滚动到可见区域"。只在选中项
-	// 发生变化的那一帧置位，否则会持续把用户手动滚走的卡片拽回来。
+	// revealChosen 表示"本帧需要把选中行滚动到可见区域"。只在选中项
+	// 发生变化的那一帧置位，否则会持续把用户手动滚走的行拽回来。
 	revealChosen bool
 
 	// reloadRequested 由界面上的"重新加载"按钮置位，下一帧真正执行扫描。
 	reloadRequested bool
+
+	// hovered/hoverValid 记录指针当前所在的行。悬停只在"进入另一行"时
+	// 才改变选择——指针静止时永远命中同一行，因此绝不会把键盘刚做出的
+	// 选择改回去（这是 ui_test.go 锁定的回归）。
+	hovered    int
+	hoverValid bool
+
+	// pointerX/pointerY 是上一帧指针在列表容器内的位置，pointerSeen 表示
+	// 指针在列表里。只有位置真的变化才算"移动"，滚动不会伪造移动。
+	pointerX, pointerY float32
+	pointerSeen        bool
+
+	// introFrames 数窗口显示后已经画过的帧数，只用于给出一次入场动画的
+	// 起始位置（见 view）。
+	introFrames int
 }
 
 var modernGradients = []ui.Color{
@@ -426,16 +444,6 @@ func truncateRunes(s string, max int) string {
 	return string(r[:max-3]) + "..."
 }
 
-func clamp(val, min, max float32) float32 {
-	if val < min {
-		return min
-	}
-	if val > max {
-		return max
-	}
-	return val
-}
-
 // ============================================================================
 // Chrome 启动
 // ============================================================================
@@ -585,578 +593,6 @@ func (a *selectorApp) requestQuit() {
 }
 
 // ============================================================================
-// 视图
-// ============================================================================
-
-func (a *selectorApp) view(c *ui.Context) {
-	// 界面线程上的"重新加载"意图，在这里真正执行扫描。
-	if a.reloadRequested {
-		a.reloadRequested = false
-		a.reload()
-	}
-
-	a.mu.Lock()
-	isDark := true
-	switch a.themeMode {
-	case ThemeDark:
-		isDark = true
-	case ThemeLight:
-		isDark = false
-	case ThemeAuto:
-		isDark = c.Theme().Dark
-	}
-
-	var (
-		bgWindow      ui.Color
-		heroCardBg    ui.Color
-		cardNormalBg  ui.Color
-		cardChosenBg  ui.Color
-		borderNormal  ui.Color
-		borderChosen  ui.Color
-		accentColor   ui.Color
-		textPrimary   ui.Color
-		textSecondary ui.Color
-		textMuted     ui.Color
-		keycapNormal  ui.Color
-		keycapChosen  ui.Color
-		segBg         ui.Color
-		segActiveBg   ui.Color
-	)
-
-	if isDark {
-		bgWindow = ui.Hex("#0D0F14")
-		heroCardBg = ui.Hex("#151821")
-		cardNormalBg = ui.Hex("#151822")
-		cardChosenBg = ui.RGBA(28, 55, 102, 0.9)
-		borderNormal = ui.RGBA(255, 255, 255, 0.08)
-		borderChosen = ui.Hex("#3B82F6")
-		accentColor = ui.Hex("#3B82F6")
-		textPrimary = ui.Hex("#FFFFFF")
-		textSecondary = ui.Hex("#94A3B8")
-		textMuted = ui.Hex("#64748B")
-		keycapNormal = ui.Hex("#0A0C10")
-		keycapChosen = ui.Hex("#3B82F6")
-		segBg = ui.Hex("#13161F")
-		segActiveBg = ui.Hex("#252A38")
-	} else {
-		bgWindow = ui.Hex("#F8FAFC")
-		heroCardBg = ui.Hex("#FFFFFF")
-		cardNormalBg = ui.Hex("#FFFFFF")
-		cardChosenBg = ui.Hex("#EFF6FF")
-		borderNormal = ui.RGBA(0, 0, 0, 0.08)
-		borderChosen = ui.Hex("#2563EB")
-		accentColor = ui.Hex("#2563EB")
-		textPrimary = ui.Hex("#0F172A")
-		textSecondary = ui.Hex("#475569")
-		textMuted = ui.Hex("#94A3B8")
-		keycapNormal = ui.Hex("#F1F5F9")
-		keycapChosen = ui.Hex("#2563EB")
-		segBg = ui.Hex("#E2E8F0")
-		segActiveBg = ui.Hex("#FFFFFF")
-	}
-
-	total := len(a.profiles)
-	launching := a.launching
-	launchError := a.launchError
-	revealChosen := a.revealChosen
-	a.revealChosen = false
-	a.mu.Unlock()
-
-	// 启动中：屏蔽重复触发，但保留 Esc 取消。
-	canLaunch := total > 0 && !launching
-
-	root := c.Root()
-	root.Background(bgWindow)
-
-	// ------------------------------------------------------------------
-	// 全局键盘快捷键
-	// ------------------------------------------------------------------
-	if c.Shortcut(0, ui.KeyEscape) {
-		// 用户主动放弃：无条件立即退出，绝不因为队列里还有链接而阻拦。
-		a.requestQuit()
-		return
-	}
-
-	if canLaunch {
-		if c.Shortcut(0, ui.KeyEnter) {
-			if a.chosen >= 0 && a.chosen < total {
-				a.openWith(a.profiles[a.chosen])
-				return
-			}
-		}
-
-		// total > 0 时才允许漫游，杜绝 % total 除零 panic。
-		if c.Shortcut(0, ui.KeyRight) {
-			if n := (a.chosen + 1) % total; n != a.chosen {
-				a.setChosen(n)
-			}
-			c.Invalidate()
-		}
-		if c.Shortcut(0, ui.KeyLeft) {
-			if n := (a.chosen - 1 + total) % total; n != a.chosen {
-				a.setChosen(n)
-			}
-			c.Invalidate()
-		}
-		if c.Shortcut(0, ui.KeyDown) {
-			if a.chosen+3 < total {
-				a.setChosen(a.chosen + 3)
-				c.Invalidate()
-			}
-		}
-		if c.Shortcut(0, ui.KeyUp) {
-			if a.chosen-3 >= 0 {
-				a.setChosen(a.chosen - 3)
-				c.Invalidate()
-			}
-		}
-
-		digitKeys := []ui.Key{ui.Key1, ui.Key2, ui.Key3, ui.Key4, ui.Key5, ui.Key6, ui.Key7, ui.Key8, ui.Key9}
-		for idx, key := range digitKeys {
-			if idx < total && c.Shortcut(0, key) {
-				a.chosen = idx
-				a.openWith(a.profiles[idx])
-				return
-			}
-		}
-	}
-
-	displayURL := a.targetURLForDisplay()
-	host, pathStr, _ := parseURLDetails(displayURL)
-	// 是否收到外部请求必须由队列本身判断，不能拿 URL 与 HomeURL 做字符串
-	// 比较：外部应用点击的正好是 HomeURL 时两者相等，会误判成"未收到外部链接"。
-	hasPending := a.hasPendingRequests()
-
-	ui.Column(c).Fill().Padding(24).Gap(16).Children(func() {
-		// --------------------------------------------------------------
-		// 1. TOP BAR: 品牌小徽标 + 三段式颜色模式切换开关
-		// --------------------------------------------------------------
-		ui.Row(c).AlignItems(ui.Center).Children(func() {
-			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
-				ui.Box(c).Size(7, 7).Radius(3.5).Background(accentColor)
-				ui.Text(c, "CHROME PROFILE ROUTER").
-					FontSize(11).
-					Bold().
-					TextColor(textSecondary)
-			})
-
-			ui.Box(c).Grow(1)
-
-			ui.Row(c).
-				Padding(2).
-				Gap(2).
-				Radius(8).
-				Background(segBg).
-				Border(1, borderNormal).
-				Children(func() {
-					renderSegment(c, "跟随系统", a.themeMode == ThemeAuto, segActiveBg, textPrimary, textMuted, func() {
-						a.themeMode = ThemeAuto
-						c.Invalidate()
-					})
-					renderSegment(c, "浅色", a.themeMode == ThemeLight, segActiveBg, textPrimary, textMuted, func() {
-						a.themeMode = ThemeLight
-						c.Invalidate()
-					})
-					renderSegment(c, "深色", a.themeMode == ThemeDark, segActiveBg, textPrimary, textMuted, func() {
-						a.themeMode = ThemeDark
-						c.Invalidate()
-					})
-				})
-		})
-
-		// --------------------------------------------------------------
-		// 2. HERO DESTINATION BLOCK
-		// --------------------------------------------------------------
-		ui.Column(c).
-			Padding(14, 18).
-			Gap(6).
-			Radius(14).
-			Background(heroCardBg).
-			Border(1.2, borderNormal).
-			Shadow(0, 4, 16, 0, ui.RGBA(0, 0, 0, 0.04)).
-			Children(func() {
-				ui.Row(c).AlignItems(ui.Center).Gap(8).Children(func() {
-					targetLabel := "TARGET URL"
-					if !hasPending {
-						targetLabel = "默认打开 Google"
-					}
-					ui.Text(c, targetLabel).
-						FontSize(9).
-						Bold().
-						TextColor(accentColor)
-
-					ui.Box(c).Grow(1)
-
-					queueNote := "选择开启身份"
-					if n := a.pendingCount(); n > 1 {
-						queueNote = fmt.Sprintf("队列剩余 %d 条", n)
-					}
-					ui.Text(c, queueNote).
-						FontSize(11).
-						TextColor(textMuted)
-				})
-
-				ui.Row(c).AlignItems(ui.Baseline).Gap(6).Children(func() {
-					ui.Text(c, host).
-						FontSize(17).
-						Bold().
-						TextColor(textPrimary).
-						SingleLine()
-
-					if pathStr != "" && pathStr != "/" {
-						ui.Text(c, truncateRunes(pathStr, 42)).
-							FontSize(12).
-							TextColor(textSecondary).
-							SingleLine()
-					}
-				})
-
-				if !hasPending {
-					ui.Text(c, "未收到外部链接，默认打开 Google").
-						FontSize(10).
-						TextColor(textMuted).
-						SingleLine()
-				}
-			})
-
-		// --------------------------------------------------------------
-		// 3. 状态区：启动中 / 错误 / 空状态
-		// --------------------------------------------------------------
-		if launching {
-			renderStatusBar(c, "正在启动 Chrome…", accentColor, textSecondary, heroCardBg, borderNormal, "")
-		}
-		if launchError != "" {
-			renderErrorBanner(c, "启动失败", launchError+`；请重试或检查 Chrome 是否已安装。`, heroCardBg, borderChosen, textSecondary)
-		}
-
-		if total == 0 {
-			renderEmptyState(c, a.loadErr, heroCardBg, borderNormal, textPrimary, textSecondary, textMuted, accentColor, func() {
-				a.reloadRequested = true
-				c.Invalidate()
-			})
-			return
-		}
-
-		// --------------------------------------------------------------
-		// 4. 3 列 Grid 卡片区（包裹在 Scroll 中，支持 >9 个账号）
-		// 增加充足的内边距，给卡片 3D 悬浮抬升与放大留出呼吸空间，防止被滚动剪裁框生硬削顶
-		// --------------------------------------------------------------
-		ui.Scroll(c).Grow(1).Padding(10, 8, 12, 8).Children(func() {
-			ui.Grid(c).Columns(3).Gap(12).Children(func() {
-				for i, p := range a.profiles {
-					idx := i
-					prof := p
-					isChosen := (idx == a.chosen)
-
-					cardBg := cardNormalBg
-					cardBorder := borderNormal
-					cardBorderW := float32(1)
-					cardShadowBlur := float32(6)
-					cardShadowCol := ui.RGBA(0, 0, 0, 0.04)
-					nameColor := textPrimary
-					subColor := textMuted
-					avatarRingCol := borderNormal
-
-					if isChosen {
-						cardBg = cardChosenBg
-						cardBorder = borderChosen
-						cardBorderW = 1.8
-						cardShadowBlur = 18
-						cardShadowCol = accentColor.Alpha(0.32)
-						nameColor = accentColor
-						avatarRingCol = accentColor
-						if isDark {
-							subColor = ui.Hex("#BFDBFE")
-						} else {
-							subColor = accentColor.Alpha(0.85)
-						}
-					}
-
-					const cardW float32 = 196
-					const cardH float32 = 86
-
-					// Key 以 Profile 目录名稳定标识卡片，Avatars/动画状态不会因重排而错位。
-					card := ui.Row(c).Key(prof.Dir).
-						Height(cardH).
-						Padding(10, 12).
-						Gap(10).
-						AlignItems(ui.Center).
-						Radius(12).
-						Background(cardBg).
-						Border(cardBorderW, cardBorder).
-						Shadow(0, 3, cardShadowBlur, 0, cardShadowCol).
-						Material(glass.Glass{Style: glass.Clear}).
-						Transition(ui.ElementTransition{Duration: 150 * time.Millisecond, Colors: true})
-
-					// 实时光标相对坐标监听
-					px, py, isOver := card.PointerPosition()
-
-					targetRotX := float32(0)
-					targetRotY := float32(0)
-					targetLift := float32(0)
-					targetScale := float32(1.0)
-
-					if isOver && !launching {
-						if a.chosen != idx {
-							a.setChosen(idx)
-						}
-
-						// Apple TV 3D 细腻视差倾斜计算
-						normX := clamp((px-(cardW/2))/(cardW/2), -1.0, 1.0)
-						normY := clamp((py-(cardH/2))/(cardH/2), -1.0, 1.0)
-
-						const maxTilt float32 = 8.5
-						targetRotX = -normY * maxTilt
-						targetRotY = normX * maxTilt
-
-						targetLift = -3.5
-						targetScale = 1.03
-					} else if isChosen {
-						targetLift = -2.5
-						targetScale = 1.02
-					}
-
-					springTilt := ui.Animation{Spring: ui.SpringOptions{Duration: 260 * time.Millisecond, Bounce: 0.12}}
-					springLift := ui.Animation{Spring: ui.SpringOptions{Duration: 300 * time.Millisecond, Bounce: 0.16}}
-
-					smoothRotX := card.AnimateTo("rotX", targetRotX, springTilt)
-					smoothRotY := card.AnimateTo("rotY", targetRotY, springTilt)
-					smoothLift := card.AnimateTo("lift", targetLift, springLift)
-					smoothScale := card.AnimateTo("scale", targetScale, springLift)
-
-					// 变换顺序：Scale -> RotateX/Y -> Perspective -> Translate。
-					// 先缩放再旋转，倾斜幅值不会随卡片尺寸被放大；透视放在
-					// 旋转之后，让透视焦点作用于已旋转的平面；位移最后应用，
-					// 抬升距离保持像素级稳定，不被透视缩放影响。
-					card.Scale(smoothScale, smoothScale).
-						RotateX(smoothRotX).
-						RotateY(smoothRotY).
-						Perspective(750).
-						Translate(0, smoothLift)
-
-					// 方向键改变选中项的那一帧，把卡片滚动到可见区域。
-					if revealChosen && isChosen {
-						card.ScrollIntoView()
-					}
-
-					card.Children(func() {
-						// 头像圆环
-						ui.Row(c).
-							Padding(1.5).
-							Radius(20).
-							Border(1.2, avatarRingCol).
-							Shadow(0, 2, 6, 0, ui.RGBA(0, 0, 0, 0.15)).
-							Transition(ui.ElementTransition{Duration: 150 * time.Millisecond, Colors: true}).
-							Children(func() {
-								if prof.Avatar != nil {
-									ui.Image(c, prof.Avatar).Size(36, 36).Radius(18)
-								} else {
-									ui.Row(c).
-										Size(36, 36).
-										Radius(18).
-										Center().
-										AlignItems(ui.Center).
-										Background(prof.Color.Alpha(0.18)).
-										Border(1, prof.Color.Alpha(0.4)).
-										Children(func() {
-											ui.Text(c, initialRune(prof.Name)).FontSize(14).Bold().TextColor(prof.Color)
-										})
-								}
-							})
-
-						// 中部文字信息
-						ui.Column(c).Grow(1).Gap(2).Children(func() {
-							ui.Text(c, prof.Name).
-								FontSize(13).
-								Bold().
-								TextColor(nameColor).
-								SingleLine()
-
-							sub := prof.Email
-							if sub == "" || sub == prof.Name {
-								sub = prof.Dir
-							}
-							ui.Text(c, truncateRunes(sub, 18)).
-								FontSize(10).
-								TextColor(subColor).
-								SingleLine()
-						})
-
-						// 右侧实体键帽
-						if idx < 9 {
-							kBg := keycapNormal
-							kText := textMuted
-							kBorder := borderNormal
-							if isChosen {
-								kBg = keycapChosen
-								kText = ui.Hex("#FFFFFF")
-								kBorder = accentColor
-							}
-
-							ui.Row(c).
-								Padding(2, 6).
-								Radius(4).
-								Background(kBg).
-								Border(1, kBorder).
-								Shadow(0, 1, 2, 0, ui.RGBA(0, 0, 0, 0.2)).
-								Children(func() {
-									ui.Text(c, fmt.Sprintf("%d", idx+1)).
-										FontSize(10).
-										Bold().
-										TextColor(kText)
-								})
-						}
-					})
-
-					if card.Clicked() && canLaunch {
-						a.openWith(prof)
-						return
-					}
-				}
-			})
-		})
-	})
-}
-
-// setChosen 更新选中项，并要求下一帧把卡片滚动到可见区域。
-func (a *selectorApp) setChosen(i int) {
-	a.mu.Lock()
-	changed := a.chosen != i
-	a.chosen = i
-	if changed {
-		a.revealChosen = true
-	}
-	a.mu.Unlock()
-}
-
-// targetURLForDisplay 供 Hero 区展示当前待处理的目标地址。
-//
-// 必须与 openWith 实际启动的地址完全一致：无队列请求时返回的正是
-// HomeURL，而不是空串——返回空串会让界面渲染出一个与真实启动无关的
-// 占位地址，用户看到的目标和 Chrome 真正打开的页面会对不上。
-func (a *selectorApp) targetURLForDisplay() string {
-	t, err := a.target()
-	if err != nil {
-		return HomeURL
-	}
-	return t
-}
-
-// initialRune 安全取出名字首字符，名字为空时不 panic。
-func initialRune(name string) string {
-	for _, r := range name {
-		return string(r)
-	}
-	return "?"
-}
-
-// renderSegment 渲染一个分段开关。
-func renderSegment(c *ui.Context, label string, active bool, activeBg, activeTxt, inactiveTxt ui.Color, onClick func()) {
-	bg := ui.Transparent
-	border := ui.Transparent
-	txtCol := inactiveTxt
-
-	if active {
-		bg = activeBg
-		border = ui.RGBA(0, 0, 0, 0.08)
-		txtCol = activeTxt
-	}
-
-	seg := ui.Row(c).
-		Padding(3, 8).
-		Radius(6).
-		Background(bg).
-		Border(1, border).
-		Children(func() {
-			ui.Text(c, label).FontSize(10).Bold().TextColor(txtCol)
-		})
-
-	if seg.Clicked() {
-		onClick()
-	}
-}
-
-// renderStatusBar 渲染轻量的进行中提示。
-func renderStatusBar(c *ui.Context, label string, accent, sub, bg, border ui.Color, detail string) {
-	ui.Row(c).
-		Padding(8, 12).
-		Gap(8).
-		Radius(10).
-		Background(bg).
-		Border(1, border).
-		AlignItems(ui.Center).
-		Children(func() {
-			ui.Box(c).Size(6, 6).Radius(3).Background(accent)
-			ui.Text(c, label).FontSize(11).Bold().TextColor(accent)
-			if detail != "" {
-				ui.Text(c, detail).FontSize(10).TextColor(sub)
-			}
-		})
-}
-
-// renderErrorBanner 渲染可读的失败原因，用户可原地重试。
-func renderErrorBanner(c *ui.Context, title, msg string, bg, border, secondary ui.Color) {
-	ui.Column(c).
-		Padding(10, 12).
-		Gap(3).
-		Radius(10).
-		Background(bg).
-		Border(1.2, border).
-		Children(func() {
-			ui.Text(c, title).FontSize(11).Bold().TextColor(border)
-			ui.Text(c, msg).FontSize(10).TextColor(secondary).SingleLine()
-		})
-}
-
-// renderEmptyState 在无法识别任何 Profile 时如实展示空状态，
-// 并提供"重新加载"按钮，而不是假装成功。
-func renderEmptyState(
-	c *ui.Context,
-	loadErr string,
-	bg, border, primary, secondary, muted, accent ui.Color,
-	onReload func(),
-) {
-	ui.Column(c).
-		Grow(1).
-		Padding(18).
-		Gap(8).
-		Radius(14).
-		Background(bg).
-		Border(1.2, border).
-		Center().
-		AlignItems(ui.Center).
-		Children(func() {
-			ui.Text(c, "未检测到有效 Chrome Profile").
-				FontSize(14).
-				Bold().
-				TextColor(primary)
-
-			ui.Text(c, "请确认已安装并登录 Chrome 后重试。").
-				FontSize(11).
-				TextColor(secondary)
-
-			if loadErr != "" {
-				ui.Text(c, truncateRunes(loadErr, 64)).
-					FontSize(10).
-					TextColor(muted).
-					SingleLine()
-			}
-
-			reload := ui.Row(c).
-				Padding(6, 14).
-				Radius(8).
-				Background(accent).
-				Children(func() {
-					ui.Text(c, "重新加载").FontSize(11).Bold().TextColor(ui.Hex("#FFFFFF"))
-				})
-
-			if reload.Clicked() {
-				onReload()
-			}
-		})
-}
-
-// ============================================================================
 // 入口
 // ============================================================================
 
@@ -1182,17 +618,24 @@ func main() {
 	// 系统关机注销）与应用自身队列清空后的退出，全部无条件直接生效。
 	mygo.App.WhenReady(func() {
 		w := mygo.NewWindow(mygo.WindowOptions{
-			Title:             "Chrome Profile Router",
-			Width:             660,
-			Height:            490,
-			MinWidth:          620,
-			MinHeight:         460,
+			Title: "Chrome Profile Router",
+			// 紧凑的瞬态面板：480×440 足够放下 4–5 个身份 + 目标地址 +
+			// 页脚，超过的行在列表内滚动。尺寸固定，避免用户把菜单拉成
+			// 一块大面板。
+			Width:             480,
+			Height:            440,
+			MinWidth:          480,
+			MinHeight:         440,
 			DisableResize:     true,
 			TitleBarStyle:     mygo.TitleBarHidden,
 			HideWindowButtons: true,
 			AlwaysOnTop:       true,
-			Vibrancy:          mygo.VibrancyPopover,
-			Content:           ui.View(a.view),
+			// Panel 让它像 Spotlight / Raycast 一样浮在当前 Space（含全屏
+			// 应用之上），不进入 Dock 与 App 切换器，并且在隐藏时把键盘
+			// 交还给用户原先所在的 App。这正是链接路由弹窗需要的语义。
+			Panel:    true,
+			Vibrancy: mygo.VibrancyPopover,
+			Content:  ui.View(a.view),
 		})
 
 		a.mu.Lock()
