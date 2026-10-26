@@ -6,15 +6,23 @@
   "fileAssociations": [
     {
       "name": "HTML document",
-      "ext": ["html", "xhtml"],
-      "role": "Viewer",
-      "uti": "public.html"
+      "ext": ["html", "htm", "xhtml"],
+      "role": "Viewer"
     }
   ],
   "macos": {
     "infoPlist": {
       "CFBundleDisplayName": "Chrome Profile Router",
-      "CFBundleName": "Chrome Profile Router"
+      "CFBundleName": "Chrome Profile Router",
+      "CFBundleDocumentTypes": [
+        {
+          "CFBundleTypeName": "HTML document",
+          "CFBundleTypeRole": "Viewer",
+          "LSHandlerRank": "Alternate",
+          "LSItemContentTypes": ["public.html", "public.xhtml"],
+          "CFBundleTypeExtensions": ["html", "htm", "xhtml"]
+        }
+      ]
     }
   },
   "out": "build"

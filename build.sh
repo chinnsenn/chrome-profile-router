@@ -23,11 +23,14 @@ if [ -f "$SCRIPT_DIR/resources/AppIcon.icns" ]; then
     cp "$SCRIPT_DIR/resources/AppIcon.icns" "$APP_TARGET/Contents/Resources/AppIcon.icns"
 fi
 
-# 补充 public.html 与 public.xhtml 声明，以符合 macOS 系统设置默认浏览器的硬性要求
+# 校验 public.html 与 public.xhtml 声明：已由 mygo.json 的 macos.infoPlist
+# 生成，此处仅对缺失的 key 做幂等兜底，避免重复追加造成数组项重复。
 PLIST="$APP_TARGET/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c 'Add :CFBundleDocumentTypes:0:LSItemContentTypes array' "$PLIST" 2>/dev/null || true
-/usr/libexec/PlistBuddy -c 'Add :CFBundleDocumentTypes:0:LSItemContentTypes:0 string "public.html"' "$PLIST" 2>/dev/null || true
-/usr/libexec/PlistBuddy -c 'Add :CFBundleDocumentTypes:0:LSItemContentTypes:1 string "public.xhtml"' "$PLIST" 2>/dev/null || true
+if ! /usr/libexec/PlistBuddy -c 'Print :CFBundleDocumentTypes:0:LSItemContentTypes' "$PLIST" >/dev/null 2>&1; then
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleDocumentTypes:0:LSItemContentTypes array' "$PLIST"
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleDocumentTypes:0:LSItemContentTypes:0 string "public.html"' "$PLIST"
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleDocumentTypes:0:LSItemContentTypes:1 string "public.xhtml"' "$PLIST"
+fi
 
 # 重新代码签名并向 Launch Services 注册
 codesign --force --deep --sign - "$APP_TARGET"
