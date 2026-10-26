@@ -839,8 +839,9 @@ func (a *selectorApp) view(c *ui.Context) {
 
 		// --------------------------------------------------------------
 		// 4. 3 列 Grid 卡片区（包裹在 Scroll 中，支持 >9 个账号）
+		// 增加充足的内边距，给卡片 3D 悬浮抬升与放大留出呼吸空间，防止被滚动剪裁框生硬削顶
 		// --------------------------------------------------------------
-		ui.Scroll(c).Grow(1).Children(func() {
+		ui.Scroll(c).Grow(1).Padding(10, 8, 12, 8).Children(func() {
 			ui.Grid(c).Columns(3).Gap(12).Children(func() {
 				for i, p := range a.profiles {
 					idx := i
