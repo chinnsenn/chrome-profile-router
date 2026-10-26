@@ -1,66 +1,62 @@
 # Chrome Profile Router
 
-> A high-performance, design-forward macOS default browser router for multi-profile Google Chrome, built with [MyGo](https://mygo.egoist.dev/).
+一个用 Go 编写的轻量 macOS 默认浏览器分流工具，用于在外部打开链接时选择使用哪个 Google Chrome 账号 Profile。
 
 ---
 
-## ✨ Features
+## 解决的问题
 
-- **Apple TV 3D Parallax Tilt**: 
-  Smooth, cursor-tracking 3D spatial rotation powered by MyGo's GPU rendering and `AnimateTo` spring physics damping. No jitter, no tearing, pure tactile feel.
-- **Dynamic Chrome Profile Discovery**:
-  Directly parses `~/Library/Application Support/Google/Chrome/Local State` at startup. Automatically extracts your real 256×256 Google account avatars (`Google Profile Picture.png`) and filters out deleted ghost profiles.
-- **Hero Destination Focus**:
-  The clicked target URL is placed at the top of the visual hierarchy with prominent domain emphasis, letting you know where you are heading before picking an identity.
-- **Adaptive 3-Way Color Themes**:
-  Native segmented control supporting **Auto (Follow System)**, **Light (Apple Platinum)**, and **Dark (Deep Obsidian)** with zero emoji noise.
-- **Keyboard Speed Dial**:
-  - `1` – `9`: Instant one-touch launch with corresponding profile.
-  - `↑` `↓` `←` `→`: 2D spatial navigation.
-  - `Enter`: Open selected profile.
-  - `Esc`: Dismiss immediately.
-- **macOS Default Browser Compliant**:
-  Configured with both `CFBundleURLTypes` (http/https) and `CFBundleDocumentTypes` (public.html), officially recognized by macOS System Settings as a default web browser.
+在日常工作中，本地 Chrome 通常会同时登录多个账号（如个人、公司主账号、海外账号、测试环境等）。
+
+当你在微信、飞书、Slack、邮件客户端或终端里点击一个网页链接时，macOS 默认只能把链接交给系统默认浏览器打开；而 Chrome 默认只会将链接丢给**最后活跃的那个窗口**，经常导致：
+- 用私人账号点开了公司内网或权限系统，提示权限不足；
+- 用工作账号点开了私人社交或娱乐链接，账号环境混乱。
+
+该工具的作用是在链接到达 Chrome 之前作为中间层拦截，弹出一个轻量选择器，由用户决定使用哪个 Profile 进行访问。
 
 ---
 
-## 🚀 Quick Start
+## 实现方案
 
-### Prerequisites
+1. **注册为系统默认浏览器**：
+   在 App 的 `Info.plist` 中声明 `CFBundleURLTypes`（http/https）与 `CFBundleDocumentTypes`（public.html），使其符合 macOS 系统设置中「默认网页浏览器」的注册门槛。
+2. **动态读取本地 Profile 配置**：
+   启动时直接解析 Chrome 本地的 `~/Library/Application Support/Google/Chrome/Local State`，动态获取所有已创建 Profile 的真实名称、绑定邮箱及物理目录，并直接读取本地缓存的头像，无需手动配置清单。
+3. **命令行唤起与即用即走**：
+   用户选择对应身份后，工具通过系统命令行直接调起 Chrome 对应的 Profile 窗口打开目标链接，随后立即退出自身，不常驻后台占用系统资源：
+   ```bash
+   open -n -a "Google Chrome" --args --profile-directory="<ProfileDir>" "<TargetURL>"
+   ```
+4. **快速操作**：
+   弹窗展示目标 URL 域名，支持直接按数字键 `1`–`9` 快速以对应身份秒开，或使用方向键配合回车，按 `Esc` 退出。支持深色、浅色及跟随系统三段切换。
+
+---
+
+## 构建与使用
+
+### 环境要求
 
 - macOS 12.0+
 - [Go](https://go.dev/) 1.27.3+
 
-### Build & Deploy
-
-Clone the repository and run the build script:
+### 编译与安装
 
 ```bash
 git clone https://github.com/chinnsenn/chrome-profile-router.git
 cd chrome-profile-router
 
-# Build and deploy to /Applications/Chrome Profile Router.app
+# 一键编译并安装至 /Applications/Chrome Profile Router.app
 ./build.sh
 ```
 
-### Set as Default Browser
+### 设为默认浏览器
 
-1. Open macOS **System Settings** → **Desktop & Dock** (or **General** on older macOS versions).
-2. Locate the **Default web browser** dropdown.
-3. Select **Chrome Profile Router**.
-
-Whenever an external application (Slack, WeChat, Terminal, Mail, Feishu, etc.) opens a link, **Chrome Profile Router** will spring into view, allowing you to route the link to the desired profile with a single keystroke.
+1. 打开 macOS **「系统设置」** → **「桌面与程序坞」**；
+2. 找到 **「默认网页浏览器」** 下拉菜单；
+3. 选择 **「Chrome Profile Router」**。
 
 ---
 
-## 🛠️ Architecture
+## License
 
-- **Engine**: [MyGo](https://mygo.egoist.dev/) (`github.com/egoist/mygo`)
-- **Graphics & Physics**: GPU Hardware-accelerated Metal rendering, `plugins/glass` (Liquid Glass), `AnimateTo` (Spring Damping).
-- **Runtime**: Pure Go, zero Electron / Webview bloat, sub-10MB bundle size, instant cold-start.
-
----
-
-## 📄 License
-
-MIT © [Senn](https://github.com/chinnsenn)
+MIT
