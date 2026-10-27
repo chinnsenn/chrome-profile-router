@@ -1,5 +1,5 @@
 // [INPUT]: 依赖 ui.Color 与 ui.Animation 类型，由 view.go 和 profile_view.go 消费。
-// [OUTPUT]: 提供浅色/深色 × 原生磨砂/不透明（高对比或降低透明度）× 的调色板（目标卡、身份卡片、悬停/选中薄底、头像描边、数字徽标与卡片/浮层投影），以及全局动效常量。
+// [OUTPUT]: 提供浅色/深色 × 原生磨砂/不透明（高对比或降低透明度）× 的调色板（目标卡、身份卡片、悬停/选中薄底、常态与选中卡的次行文字、头像描边、数字徽标与卡片/浮层投影），以及全局动效常量。
 // [POS]: 根包的视觉层样式表，不含任何状态或布局逻辑。
 // [PROTOCOL]: 变更时更新此头部，然后检查 AGENTS.md
 package main
@@ -27,10 +27,10 @@ type palette struct {
 	// 出现浑浊的灰边。
 	opaque bool
 
-	window      ui.Color // 根背景以主题色轻覆原生材质，保持文字对比
+	window      ui.Color // 根背景以主题色覆在原生材质之上；0.80 的覆盖是为文字可读性选定的适配值，材质仍负责模糊
 	destination ui.Color // 顶部目标地址卡
 	popover     ui.Color // 空格详情浮层：比地址卡更实，保证压在卡片上仍可读
-	cardShadow  ui.Color // 身份卡片的极浅投影，只在选中/悬停时使用
+	cardShadow  ui.Color // 身份卡片的极浅投影：悬停与地址卡使用；选中卡改用两级柔光，不再用它
 	popShadow   ui.Color // 空格详情浮层的投影，比卡片更深一档
 
 	rowNormal ui.Color // 身份卡片常态：几乎不可见的薄底
@@ -43,6 +43,9 @@ type palette struct {
 	textPrimary ui.Color
 	textSecond  ui.Color
 	textMuted   ui.Color
+	// textOnChosen 是选中卡上次行文字：选中底是主题色薄层，与常态底不同，
+	// 因此单独给一档，保证小字在两种外观下都够读。
+	textOnChosen ui.Color
 
 	avatarRing ui.Color // 头像细描边，把头像从卡片底上分离
 
@@ -71,6 +74,7 @@ func newPalette(dark, vibrancy, highContrast, reduceTransparency bool) palette {
 		p.textPrimary = ui.Hex("#F2F4F8")
 		p.textSecond = ui.Hex("#CDD3DE")
 		p.textMuted = ui.Hex("#AEB6C2")
+		p.textOnChosen = ui.Hex("#CDD3DE")
 		p.accent = ui.Hex("#4C9AFF")
 		p.danger = ui.Hex("#FF6B5E")
 		p.glyph = ui.Hex("#C8CDD6")
@@ -87,8 +91,8 @@ func newPalette(dark, vibrancy, highContrast, reduceTransparency bool) palette {
 			p.cardShadow = ui.Transparent
 			p.popShadow = ui.RGBA(0, 0, 0, 0.32)
 		} else {
-			p.window = ui.RGBA(22, 24, 29, 0.18)
-			p.destination = ui.RGBA(255, 255, 255, 0.055)
+			p.window = ui.RGBA(22, 24, 29, 0.80)
+			p.destination = ui.RGBA(30, 34, 41, 0.72)
 			p.popover = ui.RGBA(30, 34, 41, 0.78)
 			p.rowNormal = ui.RGBA(255, 255, 255, 0.032)
 			p.rowHover = ui.RGBA(255, 255, 255, 0.075)
@@ -105,6 +109,7 @@ func newPalette(dark, vibrancy, highContrast, reduceTransparency bool) palette {
 			p.avatarRing = ui.RGBA(255, 255, 255, 0.34)
 			p.textSecond = ui.Hex("#C6CCD6")
 			p.textMuted = ui.Hex("#A2A9B4")
+			p.textOnChosen = ui.Hex("#C6CCD6")
 		} else {
 			p.border = ui.RGBA(255, 255, 255, 0.10)
 			p.rowBorder = ui.Transparent
@@ -119,6 +124,8 @@ func newPalette(dark, vibrancy, highContrast, reduceTransparency bool) palette {
 	p.textPrimary = ui.Hex("#16181D")
 	p.textSecond = ui.Hex("#434D5A")
 	p.textMuted = ui.Hex("#5A636F")
+	// 选中底的蓝薄层会把次行灰字压暗一档，这里单独加深，保证 11.5pt 小字可读。
+	p.textOnChosen = ui.Hex("#374151")
 	p.accent = ui.Hex("#2563EB")
 	p.danger = ui.Hex("#C0392B")
 	p.glyph = ui.Hex("#4B5058")
@@ -135,8 +142,8 @@ func newPalette(dark, vibrancy, highContrast, reduceTransparency bool) palette {
 		p.cardShadow = ui.Transparent
 		p.popShadow = ui.RGBA(0, 0, 0, 0.18)
 	} else {
-		p.window = ui.RGBA(246, 246, 247, 0.18)
-		p.destination = ui.RGBA(255, 255, 255, 0.62)
+		p.window = ui.RGBA(246, 246, 247, 0.80)
+		p.destination = ui.RGBA(255, 255, 255, 0.72)
 		p.popover = ui.RGBA(255, 255, 255, 0.92)
 		p.rowNormal = ui.RGBA(255, 255, 255, 0.10)
 		p.rowHover = ui.RGBA(255, 255, 255, 0.34)
@@ -153,6 +160,7 @@ func newPalette(dark, vibrancy, highContrast, reduceTransparency bool) palette {
 		p.avatarRing = ui.RGBA(0, 0, 0, 0.32)
 		p.textSecond = ui.Hex("#3A3F47")
 		p.textMuted = ui.Hex("#4E545C")
+		p.textOnChosen = ui.Hex("#3A3F47")
 	} else {
 		p.border = ui.RGBA(0, 0, 0, 0.085)
 		p.rowBorder = ui.Transparent

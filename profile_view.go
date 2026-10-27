@@ -1,5 +1,5 @@
-// [INPUT]: 依赖 selectorApp 的状态快照、ui 包与 view_style.go 的调色板；卡片高度、间距、头像与徽标尺寸来自 layout.go；悬停倾斜与内层视差来自 card_motion.go 的 cardTilt；悬停放大与邻居让位的几何来自 hover_layout.go 的 hoverLayout。
-// [OUTPUT]: 渲染身份卡片画廊——1–4 个身份的 56pt 单列卡与 5+ 的 60pt 网格卡（身份色细条、32pt 真实头像、13.5pt 名称、11.5pt 邮箱、数字键徽标）。每张卡拆成三层：slot 是稳定布局盒，承载 Height / Shrink / FillWidth / ScrollIntoView，从不加变换；layer 是交互层，承载 Key / 命中 / Cursor / Role / Label / Description / Tooltip / Hovered / Pressed / Clicked 与悬停放大、邻居让位、按压弹簧，因命中测试会逆变换指针，放大出来的边缘同样可点；surface 是可见表面，承载 Padding / Gap / Radius / Border / Background / Shadow 与全部内容，并接受悬停 3D 倾斜与内层视差。另提供无障碍描述、悬停 Tooltip 与空格详情浮层。
+// [INPUT]: 依赖 selectorApp 的状态快照、ui 包与 view_style.go 的调色板；卡片高度、间距、头像与徽标尺寸来自 layout.go；悬停倾斜与内层视差来自 card_motion.go 的 cardTilt；悬停放大与邻居让位的几何来自 hover_layout.go 的 hoverLayout；选中卡的流彩描边与柔光参数来自 card_glow.go。
+// [OUTPUT]: 渲染身份卡片画廊——1–4 个身份的 56pt 单列卡与 5+ 的 60pt 网格卡（身份色细条、32pt 真实头像、13.5pt 名称、11.5pt 邮箱、数字键徽标）。每张卡拆成三层：slot 是稳定布局盒，承载 Height / Shrink / FillWidth / ScrollIntoView，从不加变换；layer 是交互层，承载 Key / 命中 / Cursor / Role / Label / Description / Tooltip / Hovered / Pressed / Clicked 与悬停放大、邻居让位、按压弹簧，因命中测试会逆变换指针，放大出来的边缘同样可点；surface 是可见表面，承载 Padding / Gap / Radius / Border / Background / Shadow 与全部内容，并接受悬停 3D 倾斜与内层视差。选中且非不透明回退时，surface 的 1pt 描边换成预合成的锥形流彩、并叠加两级同色柔光。另提供无障碍描述、悬停 Tooltip 与空格详情浮层。
 // [POS]: 根包的视图层分片，专管身份项呈现；状态写入与事件调度仍在 view.go，倾斜与视差的参数与变换链在 card_motion.go，空间再分配在 hover_layout.go。
 // [PROTOCOL]: 变更时更新此头部，然后检查 AGENTS.md
 package main
@@ -228,12 +228,12 @@ func (a *selectorApp) profileItem(c *ui.Context, pal palette, snap snapshot, pro
 
 	rowBg := pal.rowNormal
 	rowBorder := pal.rowBorder
-	subColor := pal.textMuted
+	subColor := pal.textSecond
 	ringColor := pal.avatarRing
 	if isChosen {
 		rowBg = pal.rowChosen
-		rowBorder = pal.accent.Alpha(0.55)
-		subColor = pal.textSecond
+		rowBorder = pal.accent.Alpha(chosenBaseBorderAlpha)
+		subColor = pal.textOnChosen
 		ringColor = pal.accent
 	}
 
@@ -277,11 +277,6 @@ func (a *selectorApp) profileItem(c *ui.Context, pal palette, snap snapshot, pro
 		if hovered && !isChosen && !pal.opaque {
 			surfaceShadow = pal.cardShadow
 		}
-		if isChosen && !pal.opaque {
-			// 选中比悬停再高一档：主题色薄底之外，一层更宽的软投影把它从
-			// 相邻卡片里托起来。阴影不参与布局，因此不会推动网格。
-			surfaceShadow = pal.cardShadow
-		}
 
 		if snap.revealChosen && isChosen {
 			slot.ScrollIntoView()
@@ -294,6 +289,10 @@ func (a *selectorApp) profileItem(c *ui.Context, pal palette, snap snapshot, pro
 		badgeShiftX, badgeShiftY := shiftX*cardParallaxBadgeRatio, shiftY*cardParallaxBadgeRatio
 
 		layer.Children(func() {
+			// 选中且非不透明回退时，描边换成预合成的锥形流彩：stops 已经
+			// 与基础选中边框合成过，所以这里不叠第二层，也不额外 DrawOver。
+			// 角度由 Keyframes 驱动；ReduceMotion 时停在 0°，静态边仍在。
+			spinning := isChosen && !pal.opaque
 			surface := ui.Row(c).
 				Fill().
 				Padding(0, 8).
@@ -301,14 +300,19 @@ func (a *selectorApp) profileItem(c *ui.Context, pal palette, snap snapshot, pro
 				AlignItems(ui.Center).
 				Radius(profileCardRadius).
 				Background(rowBg).
-				Border(1, rowBorder).
+				Border(chosenBorderWidth, rowBorder).
 				Transform(tilt)
-			if surfaceShadow.A > 0 {
-				if isChosen {
-					surface.Shadow(0, 2, 6, 0, surfaceShadow)
-				} else {
-					surface.Shadow(0, 1, 3, 0, surfaceShadow)
-				}
+			if spinning {
+				surface.BorderConicGradient(chosenBorderGradient(layer, pal, chosenSpin(layer)))
+			}
+			if spinning {
+				// 选中比悬停再高一档：主题色薄底之外，Pow 的内两级单色辉光
+				// 把它从相邻卡片里托起来。阴影不参与布局，因此不会推动网格；
+				// 它替换选中原有的单层黑影，不叠加。
+				surface.Shadow(0, 0, chosenGlowInnerRadius, 0, pal.accent.Alpha(chosenGlowAlpha(1.2)))
+				surface.Shadow(0, 0, chosenGlowOuterRadius, 0, pal.accent.Alpha(chosenGlowAlpha(4)))
+			} else if surfaceShadow.A > 0 {
+				surface.Shadow(0, 1, 3, 0, surfaceShadow)
 			}
 
 			surface.Children(func() {
