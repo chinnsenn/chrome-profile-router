@@ -10,10 +10,11 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
-// 动效时长统一落在 125–180ms：入场与颜色过渡短到不挡操作，又能被看见。
+// 内容入场 180ms、出场 120ms；控件反馈与按压保持短促。
 // 键盘导航本身不做过渡——它必须立即生效。
 const (
-	motionEntry    = 150 * time.Millisecond // 面板作为材质到位
+	motionEntry    = 180 * time.Millisecond // 内容到位
+	motionExit     = 120 * time.Millisecond // 内容离场
 	motionFeedback = 140 * time.Millisecond // 背景/边框颜色
 	motionPress    = 160 * time.Millisecond // 按压缩放
 )
@@ -169,9 +170,14 @@ func springPress() ui.Animation {
 	return ui.Animation{Spring: ui.SpringOptions{Duration: motionPress, Bounce: 0}}
 }
 
-// springEntry 以 1% 缩放和淡入提供短促的到位反馈，不改变布局或阻塞输入。
+// springEntry 用原生无回弹弹簧令内容到位，不改变布局或阻塞输入。
 func springEntry() ui.Animation {
 	return ui.Animation{Spring: ui.SpringOptions{Duration: motionEntry, Bounce: 0}}
+}
+
+// springExit 与入场共用原生弹簧语义，真正完成后才退出，不按时钟猜测完成。
+func springExit() ui.Animation {
+	return ui.Animation{Spring: ui.SpringOptions{Duration: motionExit, Bounce: 0}}
 }
 
 // fadeColors 让背景与边框颜色平滑过渡，位置与尺寸不参与，因此不会因为

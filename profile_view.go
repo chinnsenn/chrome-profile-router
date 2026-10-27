@@ -1,6 +1,6 @@
-// [INPUT]: 依赖 selectorApp 的状态快照、ui 包与 view_style.go 的调色板；卡片高度、间距、头像与徽标尺寸来自 layout.go。
-// [OUTPUT]: 渲染身份卡片画廊——1–4 个身份的 56pt 单列卡与 5+ 的 60pt 三列网格卡共用同一结构（身份色细条、32pt 真实头像、13.5pt 名称、11.5pt 邮箱、数字键徽标），并提供无障碍描述、悬停 Tooltip 与空格详情浮层。
-// [POS]: 根包的视图层分片，专管身份项呈现；状态写入与事件调度仍在 view.go。
+// [INPUT]: 依赖 selectorApp 的状态快照、ui 包与 view_style.go 的调色板；卡片高度、间距、头像与徽标尺寸来自 layout.go；悬停倾斜与内层视差来自 card_motion.go 的 cardTilt。
+// [OUTPUT]: 渲染身份卡片画廊——1–4 个身份的 56pt 单列卡与 5+ 的 60pt 三列网格卡（身份色细条、32pt 真实头像、13.5pt 名称、11.5pt 邮箱、数字键徽标）。每张卡拆成两层：外壳是纯命中盒，承载 Key / Height / AlignItems / Radius / Shrink / Cursor / Role / Label / Description / Tooltip / Hovered / Pressed / Clicked / ScrollIntoView 与点击启动、按压弹簧，不绘制任何像素；内层是可见表面，承载 Padding / Gap / Radius / Border / Background / Shadow 与全部内容，并接受悬停 3D 倾斜和内层视差，因此外壳盒子不随倾斜移动。另提供无障碍描述、悬停 Tooltip 与空格详情浮层。
+// [POS]: 根包的视图层分片，专管身份项呈现；状态写入与事件调度仍在 view.go，倾斜与视差的参数与变换链在 card_motion.go。
 // [PROTOCOL]: 变更时更新此头部，然后检查 AGENTS.md
 package main
 
@@ -62,9 +62,13 @@ func (a *selectorApp) profileList(c *ui.Context, pal palette, snap snapshot, det
 		profileDetail(c, pal, snap.profiles[snap.chosen], snap.chosen, chosenAnchor, width)
 	}
 
-	// 指针坐标取列表容器内的局部坐标：内容滚动只改变偏移，不改变它，
-	// 所以滚动绝不能被误判成"指针进入了另一行"。
-	px, py, over := list.PointerPosition()
+	// 指针坐标必须取根元素（= 窗口坐标）：列表容器的局部坐标会被祖先的
+	// 变换逐帧改写——面板进出场的 scale/translate 与卡片倾斜都在改变换，
+	// 静止的指针会因此每帧算出不同的局部坐标，被误判成"真实移动"并覆盖
+	// 键盘选择。根元素不带任何变换，坐标稳定；"指针是否在列表视口内"仍由
+	// 列表容器判定（它随面板缩放，这是正确的命中语义）。
+	px, py, _ := c.Root().PointerPosition()
+	_, _, over := list.PointerPosition()
 	if a.trackPointer(hovered, px, py, over) {
 		// 本帧画的是 trackPointer 之前的选中项，补一帧让新选择显示出来。
 		c.Invalidate()
@@ -135,6 +139,18 @@ func profileDetail(c *ui.Context, pal palette, prof Profile, idx int, anchor ui.
 // 时为首字母），中间名称 (13.5pt/600) 与邮箱/Dir (11.5pt) 两行，右侧 1–9
 // 数字键徽标。height 由 layout.go 给出（单列 56pt，网格 60pt）。
 //
+// 卡片分两层，且"可见表面"整体在倾斜层里：
+//   - 外层是纯命中盒：Key、命中区域、按下缩放、滚动定位、详情浮层锚点、
+//     无障碍标签、Tooltip 都在它身上；它完全透明，绝不做 3D 变换。
+//   - 内层是卡片表面本身：背景、1pt 描边、投影、圆角与全部内容，悬停时
+//     整块接受倾斜。因为表面和内容一起转，内容永远不会越出自己的边框——
+//     这正是 CSS tilt 的语义；若只倾斜内容而让表面保持平直，文字与身份色
+//     细条就会在卡片边缘外露出来。
+//
+// 内层用 Fill() 填满外壳的 border-box，两者严格等大，所以布局、命中区、
+// 锚点与滚动位置完全不变。内边距只放在内层：外壳若也留 Padding(0,8)，
+// 内层就会被再缩进 8pt，卡片表面跟着变窄。
+//
 // 卡片常态是几乎不可见的薄底加 1pt 透明描边：九个身份因此读作一张材质
 // 上的画廊，而不是九块玻璃。悬停只提亮底色并加一层极浅投影，选中用主题色
 // 薄底、主题色细边与实心数字徽标；两者都不改变任何几何尺寸，也都不做颜色
@@ -159,16 +175,12 @@ func (a *selectorApp) profileItem(c *ui.Context, pal palette, snap snapshot, pro
 		ringColor = pal.accent
 	}
 
-	// 边框始终占 1pt（常态透明），选中时只换颜色，布局不重排。
+	// 外壳：纯命中盒。Radius 只用于命中形状与无障碍描述，不画任何像素。
 	item := ui.Row(c).
 		Key("row:"+prof.Dir).
 		Height(height).
-		Padding(0, 8).
-		Gap(6).
 		AlignItems(ui.Center).
 		Radius(profileCardRadius).
-		Background(rowBg).
-		Border(1, rowBorder).
 		Shrink(0).
 		Cursor(ui.CursorPointer).
 		Role(ui.RoleButton).
@@ -176,24 +188,29 @@ func (a *selectorApp) profileItem(c *ui.Context, pal palette, snap snapshot, pro
 		Description(sub).
 		Tooltip(fullTip)
 
+	// 悬停/选中的判断仍读外壳：命中与交互语义只在外壳上。样式写到内层
+	// 表面，随倾斜一起转。
 	isHovered := false
 	if item.Hovered() {
 		isHovered = true
 		if !isChosen {
 			// 悬停只提亮底色并加一层极浅投影，不出现第二张卡片的体积感。
-			item.Background(pal.rowHover).Border(1, pal.border)
-			if !pal.opaque {
-				item.Shadow(0, 1, 3, 0, pal.cardShadow)
-			}
+			rowBg = pal.rowHover
+			rowBorder = pal.border
 		}
+	}
+	var surfaceShadow ui.Color
+	if isHovered && !isChosen && !pal.opaque {
+		surfaceShadow = pal.cardShadow
 	}
 	if isChosen && !pal.opaque {
 		// 选中比悬停再高一档：主题色薄底之外，一层更宽的软投影把它从
 		// 相邻卡片里托起来。阴影不参与布局，因此不会推动网格。
-		item.Shadow(0, 2, 6, 0, pal.cardShadow)
+		surfaceShadow = pal.cardShadow
 	}
 
-	// 按压反馈：短弹簧、可被打断，只动缩放，不改变任何布局。
+	// 按压反馈：短弹簧、可被打断，只动缩放，不改变任何布局。它与悬停
+	// 倾斜是两条独立的通道：按下不参与 tilt 变换链，tilt 也不改写它。
 	press := float32(1)
 	if item.Pressed() {
 		press = 0.98
@@ -205,38 +222,71 @@ func (a *selectorApp) profileItem(c *ui.Context, pal palette, snap snapshot, pro
 		item.ScrollIntoView()
 	}
 
+	// 倾斜作用于内层表面；动画通道挂在外壳上，跨帧保持同一个元素。
+	tilt, shiftX, shiftY := cardTilt(item, c)
+	// 徽标是最靠边缘的元素，视差略强一档，与 Atropos children 的深度差
+	// 一致；两个位移都取反，得到与倾斜方向相反的视差。
+	badgeShiftX, badgeShiftY := shiftX*cardParallaxBadgeRatio, shiftY*cardParallaxBadgeRatio
+
 	item.Children(func() {
-		// 身份色细条：把真实 Profile 颜色带进卡片，是除头像外唯一的
-		// 个性标识。选中时它保持本色，不随主题色改变。
-		ui.Box(c).
-			Width(profileAccentBarWidth).
-			Height(profileAccentBarHeight).
-			Radius(profileAccentBarWidth / 2).
-			Background(prof.Color.Alpha(0.85)).
-			Shrink(0)
-
-		profileAvatar(c, prof, ringColor, profileAvatarSize, profileAvatarSize/2)
-
-		ui.Column(c).Grow(1).Gap(2).MinWidth(0).Children(func() {
-			ui.Text(c, prof.Name).
-				FontSize(profileNameSize).
-				FontWeight(600).
-				TextColor(pal.textPrimary).
-				SingleLine().
-				Shrink(1).
-				MinWidth(0)
-
-			ui.Text(c, sub).
-				FontSize(profileEmailSize).
-				TextColor(subColor).
-				SingleLine().
-				Shrink(1).
-				MinWidth(0)
-		})
-
-		if idx < 9 {
-			profileShortcut(c, pal, idx, isChosen)
+		// 内层：卡片表面 + 内容。没有任何交互语义（无 Key、无 Role、
+		// 无事件），因此倾斜不会改变命中区域。
+		surface := ui.Row(c).
+			Fill().
+			Padding(0, 8).
+			Gap(6).
+			AlignItems(ui.Center).
+			Radius(profileCardRadius).
+			Background(rowBg).
+			Border(1, rowBorder).
+			Transform(tilt)
+		if surfaceShadow.A > 0 {
+			if isChosen {
+				surface.Shadow(0, 2, 6, 0, surfaceShadow)
+			} else {
+				surface.Shadow(0, 1, 3, 0, surfaceShadow)
+			}
 		}
+
+		surface.Children(func() {
+			// 身份色细条：把真实 Profile 颜色带进卡片，是除头像外唯一的
+			// 个性标识。选中时它保持本色，不随主题色改变。
+			ui.Box(c).
+				Width(profileAccentBarWidth).
+				Height(profileAccentBarHeight).
+				Radius(profileAccentBarWidth / 2).
+				Background(prof.Color.Alpha(0.85)).
+				Shrink(0)
+
+			// 头像与文字列同向位移；它们是表面的子元素，独立变换与表面
+			// 的倾斜自然组合，不会互相覆盖。
+			profileAvatar(c, prof, ringColor, profileAvatarSize, profileAvatarSize/2).
+				Transform(ui.Translation(-shiftX, -shiftY))
+
+			ui.Column(c).Grow(1).Gap(2).MinWidth(0).
+				Transform(ui.Translation(-shiftX, -shiftY)).
+				Children(func() {
+					ui.Text(c, prof.Name).
+						FontSize(profileNameSize).
+						FontWeight(600).
+						TextColor(pal.textPrimary).
+						SingleLine().
+						Shrink(1).
+						MinWidth(0)
+
+					ui.Text(c, sub).
+						FontSize(profileEmailSize).
+						TextColor(subColor).
+						SingleLine().
+						Shrink(1).
+						MinWidth(0)
+				})
+
+			if idx < 9 {
+				profileShortcut(c, pal, idx, isChosen).
+					Transform(ui.Translation(-badgeShiftX, -badgeShiftY))
+			}
+		})
 	})
 
 	if item.Clicked() && canLaunch {
@@ -257,9 +307,10 @@ func profileSubtitle(p Profile) string {
 // profileAvatar 绘制圆形头像：有图片画图，无图片画首字母。
 // size 是含描边的外径，细描边让头像从卡片底上分离出来；选中时描边换成
 // 主题色。图片比外径小 2*ring，保证描边不被图片盖住。
-func profileAvatar(c *ui.Context, prof Profile, ringColor ui.Color, size, radius float32) {
+// 返回头像元素，卡片用它承载内层视差位移。
+func profileAvatar(c *ui.Context, prof Profile, ringColor ui.Color, size, radius float32) ui.Element {
 	inner := size - 2*profileAvatarRing
-	ui.Row(c).
+	return ui.Row(c).
 		Size(size, size).
 		Radius(radius).
 		Center().
@@ -281,7 +332,8 @@ func profileAvatar(c *ui.Context, prof Profile, ringColor ui.Color, size, radius
 // profileShortcut 绘制右侧的 1–9 数字键徽标。常态是极淡的浅底加低调字色；
 // 选中时换成主题色实心徽标，作为"回车即打开这一项"的唯一强调点。徽标不做
 // 颜色过渡，与"键盘选择立即生效"保持一致。
-func profileShortcut(c *ui.Context, pal palette, idx int, isChosen bool) {
+// 返回徽标元素，卡片用它承载略强一档的内层视差位移。
+func profileShortcut(c *ui.Context, pal palette, idx int, isChosen bool) ui.Element {
 	bg := pal.shortcutBg
 	color := pal.shortcutText
 	weight := 500
@@ -290,7 +342,7 @@ func profileShortcut(c *ui.Context, pal palette, idx int, isChosen bool) {
 		color = pal.shortcutOnTxt
 		weight = 600
 	}
-	ui.Row(c).
+	return ui.Row(c).
 		Size(profileShortcutSize, profileShortcutSize).
 		Radius(profileShortcutSize / 2).
 		Center().

@@ -1,6 +1,6 @@
-// [INPUT]: 依赖 Chrome 的 Local State、MyGo 应用/窗口/屏幕/主题 API、view.go 的渲染入口，以及 layout.go 的尺寸预算。
-// [OUTPUT]: 提供 Profile 发现、链接请求队列、Chrome 启动与退出的唯一实现，创建并布局窗口，并把系统的降低透明度偏好同步给界面。
-// [POS]: 根包的状态与路由层；界面在 view.go，配色与动效在 view_style.go，纯布局计算在 layout.go。
+// [INPUT]: 依赖 Chrome 的 Local State、MyGo 应用/窗口/屏幕/主题 API、view.go 渲染、motion.go 内容生命周期，以及 layout.go 尺寸预算。
+// [OUTPUT]: 提供 Profile 发现、链接请求队列与 Chrome 启动，成功交付后推进自然出场，创建并布局窗口，同步降低透明度偏好。
+// [POS]: 根包的状态与路由层；界面在 view.go，内容进出场在 motion.go，配色与动效参数在 view_style.go，纯布局在 layout.go。
 // [PROTOCOL]: 变更时更新此头部，然后检查 AGENTS.md
 package main
 
@@ -126,9 +126,9 @@ type selectorApp struct {
 	pointerX, pointerY float32
 	pointerSeen        bool
 
-	// introFrames 数窗口显示后已经画过的帧数，只用于给出一次入场动画的
-	// 起始位置（见 view）。
-	introFrames int
+	// motion 与 quit 的状态写入受 mu 保护；quit 未设置时退出原生应用。
+	motion panelMotion
+	quit   func()
 }
 
 var modernGradients = []ui.Color{
@@ -321,6 +321,7 @@ func (a *selectorApp) enqueue(r request) {
 	r.ID = a.nextID
 	a.pending = append(a.pending, r)
 	a.launchError = ""
+	a.cancelNaturalExitLocked()
 	a.mu.Unlock()
 
 	// 新请求到达时清掉上一轮的失败提示，并把窗口拉回前台。
@@ -581,33 +582,16 @@ func (a *selectorApp) advanceQueue(launchedID uint64) {
 	if launchedID != 0 && len(a.pending) > 0 && a.pending[0].ID == launchedID {
 		a.pending = a.pending[1:]
 	}
-	// 只有队列真的空了才能退出：HomeURL 启动时队列里可能已有新请求，
-	// 直接 Quit 会把这些链接连同窗口一起吞掉。
 	remaining := len(a.pending)
 	a.mu.Unlock()
-
 	if remaining == 0 {
-		// 队列全部处理完毕：自然结束进程。这里不做任何拦截复核，退出就是
-		// 退出——保留一个"退出前再检查一次"的钩子只会让状态机重新变复杂。
-		a.requestQuit()
+		a.beginExit(exitNatural)
 		return
 	}
-
-	// 还有链接在排队：窗口留在前台并更新界面，等待用户选择下一个身份。
 	if w := a.windowRef(); w != nil {
 		w.Update(func() {})
 		w.Show()
 	}
-}
-
-// requestQuit 是发起退出的统一入口：无条件、直接退出。
-//
-// 应用自身在队列清空后调用它，用户按 Esc 也调用它；⌘Q、菜单栏 Quit、
-// Dock 退出、系统关机 / 注销则由 macOS 原生投递到同一条退出管道。所有
-// 路径共享同一个语义——退出就是退出，没有任何拦截器、布尔标志或竞态可
-// 能把用户意图吞掉。
-func (a *selectorApp) requestQuit() {
-	mygo.App.Quit()
 }
 
 // ============================================================================
@@ -690,11 +674,12 @@ func (a *selectorApp) requestLayout(count int) {
 	})
 }
 
-// showWithLayout 在显示前完成首次尺寸与居中，避免面板先出现在旧位置再
-// 跳到正确大小。启动路径专用：此时还没有任何渲染帧，可以同步写入。
+// showWithLayout 在显示前完成尺寸与居中，并重置入场，隐藏帧不会消耗它。
 func (a *selectorApp) showWithLayout(w *mygo.Window) {
 	a.applyLayout(w, a.profileCount(), cursorWorkArea(), true)
+	a.resetEntry()
 	w.Show()
+	w.Invalidate()
 }
 
 // handleDisplaysChanged 在显示器增删或分辨率变化后，按窗口当前所在屏幕
@@ -744,8 +729,7 @@ func main() {
 		a.enqueue(request{Kind: requestFile, Value: f})
 	})
 
-	// 退出没有任何拦截器：用户意图（Esc / ⌘Q / 菜单 Quit / Dock 退出 /
-	// 系统关机注销）与应用自身队列清空后的退出，全部无条件直接生效。
+	// 原生关闭、Esc、⌘Q 与系统退出不拦截；内容短出场由自身完成后退出。
 	mygo.App.WhenReady(func() {
 		// 屏幕查询只在 WhenReady 之后可用，所以首次尺寸也在这里算：
 		// 先按空状态拿到一个保守的起始尺寸，避免窗口以默认 800×600 出现

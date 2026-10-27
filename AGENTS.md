@@ -8,11 +8,15 @@ resources/ - 应用图标源与打包资产
 
 成员清单
 main.go: Profile 发现、请求队列、Chrome 启动与应用生命周期；按屏幕工作区调整窗口，成功启动后才将对应请求 ID 出队。
+motion.go: 内容层的入场与可中断出场生命周期（180ms 淡入 / 120ms 出场、缩放与 Y 位移、仅内容层降透明度）；以动画通道 Settled 判定完成并经 Window.Update 投递后 Quit，新请求在同一把锁下取消自然出场，显式关闭不被取消。
 layout.go: 单列与三列画廊共享的列数、卡片高度、头像/徽标尺寸和窗口尺寸预算；固定控件高度推导窗口尺寸，不预留未显示状态的空白。
-view.go: 整幅宽度的目标地址卡加身份画廊与用户输入，状态在地址卡次行内反馈；手动主题同步原生磨砂外观。
-profile_view.go: 单列与三列共用身份卡片（身份色细条、32pt 真实头像、名称/邮箱两行、数字键徽标），提供悬停反馈、无障碍描述与空格详情浮层。
+view.go: 整幅宽度的目标地址卡加身份画廊与用户输入，按钮与 ⌘C 复制完整 URL 并就地反馈，状态在地址卡次行内反馈；手动主题同步原生磨砂外观。
+profile_view.go: 单列与三列共用身份卡片（身份色细条、32pt 真实头像、名称/邮箱两行、数字键徽标），拆成纯命中外壳与内层可见表面两层，外壳盒子不随倾斜移动；提供无障碍描述、悬停 Tooltip 与空格详情浮层。
+card_motion.go: 身份卡悬停 3D 倾斜与内层视差（5.5° 上限、透视距离为卡宽 2.5 倍、悬停 1.01、内容 1.5pt / 徽标 2pt、可打断弹簧跟随、离开归中）；只输出变换，不写选择、不改布局与命中区域。
 view_style.go: 原生磨砂上的地址卡与卡片薄层、细边界、卡片投影与轻量反馈，保持文字对比；高对比或降低透明度时改用不透明表面并去掉投影。
 ui_test.go: 混合输入、九身份同屏、末行边界和窄屏导航回归，防止静止悬停覆盖键盘选择。
+card_motion_test.go: 倾斜方向与钳制、ReduceMotion 归零、外壳几何不变、真实 3D 变换、网格顺序与列数、内容不越界、跨卡片宽度强度一致。
+motion_test.go: 出场等待、显式关闭优先级、重置入场、立即中断、新请求取消与 ReduceMotion 的行为回归。
 routing_test.go: 请求队列、失败重试与文件 URL 编码的行为边界。
 build.sh: 根据本机架构构建，在目标卷暂存验签后替换应用，失败时恢复旧包。
 README.md: 用户操作、构建安装与验证说明。
@@ -23,6 +27,9 @@ mygo.json: Bundle 标识、URL scheme、文档类型和版本的唯一声明来�
 - `mygo.App.OnOpenURL` / `OnOpenFile` 统一入队；不再手动遍历启动参数，避免重复请求。
 - `openWith` 持锁时只调用 `targetLocked` / `currentLocked`；Chrome 启动在后台运行，结果经 Window.Update 回到主线程。
 - Esc、关闭按钮、系统退出不受队列或动效拦截；装饰性动效不能延迟键盘选择与链接交付。
+- 退出只在真实动画通道（Scale/Y/Opacity 三个 Settled）完成后才 Quit，用 Window.Update 投递并复核代次；不得用 Sleep 或固定时长猜测完成，也不得设置退出拦截器——Esc、⌘Q、原生关闭与系统退出始终走立即退出通路。
+- 指针坐标取 `c.Root().PointerPosition()`（窗口坐标），是否在列表视口内取列表容器的第三返回值；不得改读面板或卡片的局部坐标，祖先变换会把它伪造成指针移动并覆盖键盘选择。
+- 悬停倾斜只作用于卡片内层表面，不得加在命中盒上（否则命中区域、锚点与滚动位置随角度漂移）；系统开启减少动态效果时倾斜、视差与入场位移必须全部归零。
 - 原生材料负责背景模糊，文本保持不透明；不得通过全窗口 Opacity 降低可读性。系统开启「降低透明度」或高对比时，界面改用实色表面并去掉投影。
 - 1–4 个身份使用单列卡片，更多身份按可用宽度排成最多三列画廊；列数、卡片高度与头像尺寸只来自 layout.go，状态提示不能改变窗口尺寸或身份顺序。
 - 只有地址卡与详情浮层是带投影的表面，身份卡常态近透明；不得把每张卡片做成独立玻璃，也不得用投影改变布局尺寸。
@@ -30,6 +37,6 @@ mygo.json: Bundle 标识、URL scheme、文档类型和版本的唯一声明来�
 - 图标修改同步 SVG 与 PNG，MyGo 自动生成 ICNS；不得在安装后另行修改已签名资源。
 
 验证
-`go test ./...`、`go vet ./...`、`bash -n build.sh`；打包使用 `go run github.com/egoist/mygo/cmd/mygo build -skip-dmg -platform darwin/arm64,darwin/amd64`。`./build.sh` 会替换 `/Applications` 中的应用，仅在需要本机安装时执行。
+`go test ./...`、`go test -race ./...`、`go vet ./...`、`bash -n build.sh`；打包使用 `go run github.com/egoist/mygo/cmd/mygo build -skip-dmg -platform darwin/arm64,darwin/amd64`。`./build.sh` 会替换 `/Applications` 中的应用，仅在需要本机安装时执行。
 
-[PROTOCOL]: 变更时更新此头部，然后检查 AGENTS.md
+[PROTOCOL]: 变更时更新此头部，然后检查 AGENTS.md（成员清单、约束与验证三节必须与实际实现一致）

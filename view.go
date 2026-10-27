@@ -1,5 +1,5 @@
-// [INPUT]: 依赖 selectorApp 的队列/启动状态、MyGo 原生外观与 ui 包、view_style.go 调色板，以及 layout.go 布局常量。
-// [OUTPUT]: 渲染整幅宽度的地址卡与身份画廊，组织头部/目标地址卡/身份列表，并把指针与键盘意图转成选择、启动与退出。
+// [INPUT]: 依赖 selectorApp 队列/启动状态、MyGo ui 包、view_style.go 调色板、motion.go 内容生命周期，以及 layout.go 布局常量。
+// [OUTPUT]: 渲染整幅宽度的地址卡与身份画廊，支持按钮/⌘C 复制完整 URL，并把指针与键盘意图转成选择、启动与退出。
 // [POS]: 根包的视图层主入口；身份项渲染委托给 profile_view.go，路由与队列逻辑仍在 main.go。
 // [PROTOCOL]: 变更时更新此头部，然后检查 AGENTS.md
 package main
@@ -7,6 +7,7 @@ package main
 import (
 	"fmt"
 	"net/url"
+	"os/exec"
 	"strings"
 
 	"github.com/egoist/mygo"
@@ -75,19 +76,9 @@ func (a *selectorApp) view(c *ui.Context) {
 	// 主题色半透明覆盖原生磨砂，手动主题也保持对比度；文字始终不透明。
 	c.Root().Background(pal.window)
 
-	// 面板作为一层材质"到位"：第一帧停在 0.99 与全透明（Jump 是瞬时赋值，
-	// 不产生过渡），随后 150ms 内用快弹簧归位。只动变换与不透明度，
-	// 不改布局；ReduceMotion 下框架直接取目标值，等于没有动画。
+	// 原生磨砂与 Root 始终不变，进出场只作用于内容层。
 	panel := ui.Column(c).Fill().Padding(panelPadding).Gap(menuGap)
-	if a.introFrames == 0 {
-		panel.Jump("introFade", 0)
-		panel.Jump("introScale", 0.99)
-	}
-	a.introFrames++
-	entry := springEntry()
-	panel.Opacity(panel.AnimateTo("introFade", 1, entry))
-	scale := panel.AnimateTo("introScale", 1, entry)
-	panel.Scale(scale, scale)
+	a.animatePanel(c, panel)
 
 	panel.Children(func() {
 		a.header(c, pal, snap.themeMode)
@@ -235,7 +226,7 @@ func (a *selectorApp) header(c *ui.Context, pal palette, mode ThemeMode) {
 		DragWindow().
 		Shrink(0).
 		Children(func() {
-			closeControl(c, pal, a.requestQuit)
+			closeControl(c, pal, func() { a.beginExit(exitClose) })
 
 			ui.Spacer(c)
 
@@ -263,12 +254,31 @@ func (a *selectorApp) header(c *ui.Context, pal palette, mode ThemeMode) {
 //
 // 高度固定为 menuDestinationHeight：任何状态都只替换次行文字，绝不新增一块
 // 卡片或撑高面板，因此错误与启动中不会挤压身份列表，也不会留下空白。
-// 整个区域可拖动窗口，同时悬停给出完整 URL（含 query 与 fragment）。
+// 地址文字区域可拖动窗口，悬停给出完整 URL；右侧按钮与 ⌘C 复制原始地址。
 func (a *selectorApp) destination(c *ui.Context, pal palette, snap snapshot) {
 	full := a.targetURLForDisplay()
 	host, pathStr, _ := parseURLDetails(full)
 	// 是否收到外部请求由队列本身判断，绝不与 HomeURL 做字符串比较。
 	hasPending := a.hasPendingRequests()
+	copyState := ui.Local(c.Root(), "destinationCopy", func() struct{ url, message string } {
+		return struct{ url, message string }{}
+	})
+	if copyState.url != full {
+		copyState.url, copyState.message = full, ""
+	}
+	copyURL := func() {
+		cmd := exec.Command("/usr/bin/pbcopy")
+		cmd.Stdin = strings.NewReader(full)
+		if err := cmd.Run(); err != nil {
+			copyState.message = "复制失败"
+		} else {
+			copyState.message = "已复制"
+		}
+		c.Invalidate()
+	}
+	if c.Shortcut(ui.Cmd, ui.KeyC) {
+		copyURL()
+	}
 
 	// 本地文件没有域名：主行改用文件名，次行给出完整路径，避免 24pt 粗体
 	// 铺满一整条地址。网页地址仍以域名为主行。
@@ -322,7 +332,6 @@ func (a *selectorApp) destination(c *ui.Context, pal palette, snap snapshot) {
 		Radius(12).
 		Background(pal.destination).
 		Border(1, pal.border).
-		DragWindow().
 		Tooltip(full)
 
 	if !pal.opaque {
@@ -346,7 +355,8 @@ func (a *selectorApp) destination(c *ui.Context, pal palette, snap snapshot) {
 					TextColor(pal.textPrimary).
 					SingleLine().
 					Shrink(1).
-					MinWidth(0)
+					MinWidth(0).
+					DragWindow()
 				ui.Spacer(c)
 				if queueNote != "" {
 					ui.Row(c).
@@ -361,6 +371,22 @@ func (a *selectorApp) destination(c *ui.Context, pal palette, snap snapshot) {
 								TextColor(pal.textMuted).
 								SingleLine()
 						})
+				}
+				label := "复制"
+				if copyState.message != "" {
+					label = copyState.message
+				}
+				button := ui.Row(c).Key("copyURL").Padding(4, 7).Radius(5).
+					Shrink(0).Cursor(ui.CursorPointer).Role(ui.RoleButton).
+					Label("复制完整 URL").Tooltip("复制完整 URL（⌘C）")
+				if button.Hovered() {
+					button.Background(pal.rowHover)
+				}
+				button.Children(func() {
+					ui.Text(c, label).FontSize(11).TextColor(pal.textSecond).SingleLine()
+				})
+				if button.Clicked() {
+					copyURL()
 				}
 			})
 
@@ -393,7 +419,7 @@ func (a *selectorApp) destination(c *ui.Context, pal palette, snap snapshot) {
 // ============================================================================
 
 // closeControl 是左上角的小关闭控件：两条交叉笔画，带无障碍名称。
-// 它无条件调用 requestQuit，因此在启动中、错误与空状态下都可用。
+// 它在启动中、错误与空状态下都可用；首次短出场，再次点击立即退出。
 // 边长等于 menuHeaderHeight，保证控件在 22pt 头部内完整显示而不被裁切。
 func closeControl(c *ui.Context, pal palette, onClose func()) {
 	btn := ui.Row(c).
