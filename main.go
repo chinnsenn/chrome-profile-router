@@ -1,6 +1,6 @@
-// [INPUT]: 依赖 Chrome 的 Local State、MyGo 应用/窗口 API，以及 view.go 的渲染入口。
-// [OUTPUT]: 提供 Profile 发现、链接请求队列、Chrome 启动与退出的唯一实现，并创建窗口。
-// [POS]: 根包的状态与路由层；界面在 view.go，配色与动效在 view_style.go。
+// [INPUT]: 依赖 Chrome 的 Local State、MyGo 应用/窗口/屏幕/主题 API、view.go 的渲染入口，以及 layout.go 的尺寸预算。
+// [OUTPUT]: 提供 Profile 发现、链接请求队列、Chrome 启动与退出的唯一实现，创建并布局窗口，并把系统的降低透明度偏好同步给界面。
+// [POS]: 根包的状态与路由层；界面在 view.go，配色与动效在 view_style.go，纯布局计算在 layout.go。
 // [PROTOCOL]: 变更时更新此头部，然后检查 AGENTS.md
 package main
 
@@ -93,9 +93,20 @@ type selectorApp struct {
 	window    *mygo.Window
 	themeMode ThemeMode
 
+	// placed 与 layoutCount 记录窗口布局状态，只在主线程读写：placed 表示
+	// 已经完成首次定位（首次居中，之后保持用户拖到的位置），layoutCount 是
+	// 上次布局使用的身份数量。界面渲染从不读取它们，因此不进 snapshot。
+	placed      bool
+	layoutCount int
+
 	// 启动状态：launching 防重入，launchError 用于界面回显失败原因。
 	launching   bool
 	launchError string
+
+	// reduceTransparency 是系统"降低透明度"偏好，由 WhenReady 读取并在
+	// 主题偏好变化时刷新；界面只通过 snapshot 读取，据此把半透明表面换成
+	// 实色。
+	reduceTransparency bool
 
 	// revealChosen 表示"本帧需要把选中行滚动到可见区域"。只在选中项
 	// 发生变化的那一帧置位，否则会持续把用户手动滚走的行拽回来。
@@ -264,28 +275,35 @@ func sortedDirs(cache map[string]struct {
 }
 
 // reload 重新扫描磁盘上的 Chrome Profile，并如实记录失败原因。
+//
+// 主线程调用。扫描与状态写入都在锁外/锁内明确分段：持锁时只改内存字段，
+// 释放锁之后才决定窗口尺寸——MyGo 的窗口调用可能回到主线程并触发重绘，
+// 绝不能在持有 a.mu 时调用。
 func (a *selectorApp) reload() {
 	list, err := loadChromeProfiles()
 
 	a.mu.Lock()
-	defer a.mu.Unlock()
-
 	if err != nil {
 		a.profiles = nil
 		a.loadErr = err.Error()
 		a.chosen = 0
-		return
+	} else {
+		a.profiles = list
+		a.loadErr = ""
+		if a.chosen >= len(list) {
+			a.chosen = len(list) - 1
+		}
+		if a.chosen < 0 {
+			a.chosen = 0
+		}
+		a.revealChosen = true
 	}
+	count := len(a.profiles)
+	a.mu.Unlock()
 
-	a.profiles = list
-	a.loadErr = ""
-	if a.chosen >= len(list) {
-		a.chosen = len(list) - 1
-	}
-	if a.chosen < 0 {
-		a.chosen = 0
-	}
-	a.revealChosen = true
+	// 只有身份数量真的变化才重排窗口：选择、悬停、启动状态与错误提示
+	// 都不会改变列数，也不应该让窗口跳动。
+	a.requestLayout(count)
 }
 
 // ============================================================================
@@ -593,6 +611,118 @@ func (a *selectorApp) requestQuit() {
 }
 
 // ============================================================================
+// 窗口布局
+// ============================================================================
+
+// profileCount 返回当前身份数量；只在持锁时读切片长度。
+func (a *selectorApp) profileCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.profiles)
+}
+
+// cursorWorkArea 返回光标所在显示器的工作区，用于窗口首次弹出。
+func cursorWorkArea() mygo.Rectangle {
+	return mygo.Screen.DisplayNearestPoint(mygo.Screen.CursorScreenPoint()).WorkArea
+}
+
+// windowWorkArea 返回窗口当前主要落在的显示器工作区。窗口被拖到另一块
+// 屏幕或被拔掉屏幕后，这里给出的是它现在真正所属的可用区域。
+func windowWorkArea(w *mygo.Window) mygo.Rectangle {
+	return mygo.Screen.DisplayMatching(w.Bounds()).WorkArea
+}
+
+// applyLayout 按身份数量与工作区写入窗口的内容区尺寸和位置，必须在主线程
+// 调用，且不能在渲染帧中途调用（见 requestLayout）。
+//
+// recenter 只在首次弹出时为真：那一次把面板居中在参考屏幕上；之后一律
+// 保留用户拖到的位置，仅把它夹回工作区内，避免重算尺寸时窗口无端跳回
+// 屏幕中央。
+func (a *selectorApp) applyLayout(w *mygo.Window, count int, workArea mygo.Rectangle, recenter bool) {
+	width, height := profilePanelSize(count, workArea)
+
+	// 先记住当前左上角：改尺寸时系统可能把外框原点挪动（macOS 以左下角
+	// 为锚点），重排后必须按用户原来的位置写回，而不是接受漂移。
+	b := w.Bounds()
+	x, y := b.X, b.Y
+
+	// 尺寸用内容区表达（布局预算是按界面内容算的），位置用窗口外框表达
+	// （工作区是屏幕坐标）。
+	if curW, curH := w.ContentSize(); curW != width || curH != height {
+		w.SetContentSize(width, height)
+		b = w.Bounds()
+	}
+
+	if recenter || !a.placed {
+		x, y = centeredOrigin(workArea, b.Width, b.Height)
+	}
+	// 外框可能比内容区略高（系统标题栏高度），居中后再夹一次，保证整块
+	// 面板始终完整落在工作区内。用户自己拖到的位置只做夹取，不重排。
+	if tx, ty := clampOrigin(workArea, x, y, b.Width, b.Height); tx != b.X || ty != b.Y {
+		w.SetPosition(tx, ty)
+	}
+
+	a.placed = true
+	a.layoutCount = count
+}
+
+// requestLayout 安排一次窗口重排，身份数量没变时什么也不做。
+//
+// 真正的原生写入走 Window.Update，投递到下一轮主线程循环：reload 可能
+// 正在渲染帧内被"重新加载"按钮触发，此刻直接改窗口尺寸会让内容宿主在
+// 渲染途中收到 resize 回调。投递既避开重入，也不需要任何锁——闭包内的
+// 状态只在主线程读写。
+func (a *selectorApp) requestLayout(count int) {
+	// 还没排过版：启动路径会用 showWithLayout 在显示前一次性定位。
+	if !a.placed || a.layoutCount == count {
+		return
+	}
+	w := a.windowRef()
+	if w == nil {
+		return
+	}
+	w.Update(func() {
+		// 投递期间可能已经有别的路径排过版。
+		if !a.placed || a.layoutCount == count {
+			return
+		}
+		a.applyLayout(w, count, windowWorkArea(w), false)
+	})
+}
+
+// showWithLayout 在显示前完成首次尺寸与居中，避免面板先出现在旧位置再
+// 跳到正确大小。启动路径专用：此时还没有任何渲染帧，可以同步写入。
+func (a *selectorApp) showWithLayout(w *mygo.Window) {
+	a.applyLayout(w, a.profileCount(), cursorWorkArea(), true)
+	w.Show()
+}
+
+// handleDisplaysChanged 在显示器增删或分辨率变化后，按窗口当前所在屏幕
+// 重新限制尺寸与位置。窗口可能已经被移到不存在的坐标上，因此这里总是
+// 夹回工作区，但仍然保留用户的相对位置。
+//
+// 回调可能来自任意线程，所以只做投递，真正的原生写入留在主线程。
+func (a *selectorApp) handleDisplaysChanged() {
+	w := a.windowRef()
+	if w == nil {
+		return
+	}
+	w.Update(func() {
+		if a.placed {
+			a.relayout(w)
+		}
+	})
+}
+
+// relayout 立即按窗口当前所在屏幕重排一次，主线程调用。
+//
+// 与 requestLayout 的区别只在时机：它不做"身份数量没变就跳过"的判断，
+// 因为显示器本身变了，即使列数相同也要重新夹回新的工作区。
+func (a *selectorApp) relayout(w *mygo.Window) {
+	a.applyLayout(w, a.profileCount(), windowWorkArea(w), false)
+}
+
+// ============================================================================
 // 入口
 // ============================================================================
 
@@ -617,15 +747,22 @@ func main() {
 	// 退出没有任何拦截器：用户意图（Esc / ⌘Q / 菜单 Quit / Dock 退出 /
 	// 系统关机注销）与应用自身队列清空后的退出，全部无条件直接生效。
 	mygo.App.WhenReady(func() {
+		// 屏幕查询只在 WhenReady 之后可用，所以首次尺寸也在这里算：
+		// 先按空状态拿到一个保守的起始尺寸，避免窗口以默认 800×600 出现
+		// 在用户眼前；真实尺寸由 showWithLayout 在显示前写入。
+		area := cursorWorkArea()
+		startW, startH := profilePanelSize(0, area)
+
 		w := mygo.NewWindow(mygo.WindowOptions{
 			Title: "Chrome Profile Router",
-			// 紧凑的瞬态面板：480×440 足够放下 4–5 个身份 + 目标地址 +
-			// 页脚，超过的行在列表内滚动。尺寸固定，避免用户把菜单拉成
-			// 一块大面板。
-			Width:             480,
-			Height:            440,
-			MinWidth:          480,
-			MinHeight:         440,
+			// 尺寸由 profilePanelSize 依据身份数量与工作区决定：1–4 个
+			// 身份是 460 宽的单列卡片，5 个起是 700 宽的三列画廊（窄屏
+			// 自动降到 2 或 1 列）。窗口仍不可拖动改变大小，但不设固定
+			// 最小尺寸——否则窄屏上无法把面板收进工作区。
+			Width:             startW,
+			Height:            startH,
+			UseContentSize:    true,
+			Hidden:            true,
 			DisableResize:     true,
 			TitleBarStyle:     mygo.TitleBarHidden,
 			HideWindowButtons: true,
@@ -642,10 +779,26 @@ func main() {
 		a.window = w
 		a.mu.Unlock()
 
+		// 显示器增删或分辨率变化后，按窗口当前所在屏幕重新限制尺寸与
+		// 位置。回调可能来自任意线程，因此只做投递，真正的原生写入留在
+		// 主线程。
+		mygo.Screen.OnDisplaysChanged(a.handleDisplaysChanged)
+
+		// 无障碍偏好只在应用运行后可读，因此在窗口就绪后读取一次，并在
+		// 主题设置变化时刷新；界面帧不再直接访问 mygo.Theme。
+		a.setReduceTransparency(mygo.Theme.Preferences().ReduceTransparency)
+		mygo.Theme.OnUpdated(func() {
+			a.setReduceTransparency(mygo.Theme.Preferences().ReduceTransparency)
+			if w := a.windowRef(); w != nil {
+				w.Update(func() {})
+			}
+		})
+
 		// 窗口就绪后再扫描 Profile，保证空状态 / 重新加载能安全重绘。
+		// 扫描在显示之前完成，首次出现的面板就已经是最终尺寸。
 		a.reload()
 
-		w.Show()
+		a.showWithLayout(w)
 	})
 
 	if err := mygo.App.Run(); err != nil {

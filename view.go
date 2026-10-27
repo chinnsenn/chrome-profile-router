@@ -1,22 +1,16 @@
-// [INPUT]: 依赖 selectorApp 的队列/启动状态、ui 包，以及 view_style.go 的调色板与动效。
-// [OUTPUT]: 渲染紧凑半透明的路由菜单，并把指针与键盘意图转成选择、启动与退出。
-// [POS]: 根包的视图层；路由、启动与队列逻辑仍在 main.go。
+// [INPUT]: 依赖 selectorApp 的队列/启动状态、MyGo 原生外观与 ui 包、view_style.go 调色板，以及 layout.go 布局常量。
+// [OUTPUT]: 渲染整幅宽度的地址卡与身份画廊，组织头部/目标地址卡/身份列表，并把指针与键盘意图转成选择、启动与退出。
+// [POS]: 根包的视图层主入口；身份项渲染委托给 profile_view.go，路由与队列逻辑仍在 main.go。
 // [PROTOCOL]: 变更时更新此头部，然后检查 AGENTS.md
 package main
 
 import (
 	"fmt"
+	"net/url"
+	"strings"
 
+	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
-)
-
-const (
-	// panelPadding 是窗口内容的内边距，顶部/目标/列表/页脚共用。
-	panelPadding float32 = 16
-	// rowHeight 与 rowGap 决定一行身份的尺寸：480×440 下约可见 5 行，
-	// 更多身份时列表滚动，键盘选择仍会把目标行滚入视野。
-	rowHeight float32 = 44
-	rowGap    float32 = 6
 )
 
 // snapshot 是一帧渲染所需的全部状态，只在持锁时取一次，
@@ -29,6 +23,9 @@ type snapshot struct {
 	launchError  string
 	loadErr      string
 	revealChosen bool
+	// reduceTransparency 是系统"降低透明度"偏好：与其它帧状态一起在持锁
+	// 时复制，渲染期间不再回读 selectorApp。
+	reduceTransparency bool
 }
 
 // view 绘制整个窗口。它只读 selectorApp 的状态，所有副作用都在本帧内
@@ -60,10 +57,20 @@ func (a *selectorApp) view(c *ui.Context) {
 		snap.chosen = 0
 	}
 
+	detailOpen := ui.Local(c.Root(), "profileDetailOpen", func() bool { return false })
+	if c.Shortcut(0, ui.KeySpace) && !snap.launching && len(snap.profiles) > 0 {
+		*detailOpen = !*detailOpen
+		c.Invalidate()
+	}
+	if snap.launching || len(snap.profiles) == 0 {
+		*detailOpen = false
+	}
 	dark := snap.themeMode == ThemeDark || (snap.themeMode == ThemeAuto && c.Theme().Dark)
-	// 原生磨砂由窗口提供；高对比模式使用实色，减少动态效果由框架处理。
-	// c.Vibrancy 仅反映窗口材质配置，不等同于系统的降低透明度偏好。
-	pal := newPalette(dark, c.Vibrancy(), c.Preferences().HighContrast)
+	// 原生磨砂由窗口提供；高对比与系统"降低透明度"都改用实色表面。
+	// c.Vibrancy 仅反映窗口材质配置，不等同于无障碍偏好；降低透明度由
+	// main.go 在应用启动后读取一次并随主题变化刷新，渲染帧不再访问
+	// mygo.Theme（那会在离屏测试里 panic）。减少动态效果由框架处理。
+	pal := newPalette(dark, c.Vibrancy(), c.Preferences().HighContrast, snap.reduceTransparency)
 
 	// 主题色半透明覆盖原生磨砂，手动主题也保持对比度；文字始终不透明。
 	c.Root().Background(pal.window)
@@ -71,7 +78,7 @@ func (a *selectorApp) view(c *ui.Context) {
 	// 面板作为一层材质"到位"：第一帧停在 0.99 与全透明（Jump 是瞬时赋值，
 	// 不产生过渡），随后 150ms 内用快弹簧归位。只动变换与不透明度，
 	// 不改布局；ReduceMotion 下框架直接取目标值，等于没有动画。
-	panel := ui.Column(c).Fill().Padding(panelPadding).Gap(10)
+	panel := ui.Column(c).Fill().Padding(panelPadding).Gap(menuGap)
 	if a.introFrames == 0 {
 		panel.Jump("introFade", 0)
 		panel.Jump("introScale", 0.99)
@@ -84,22 +91,15 @@ func (a *selectorApp) view(c *ui.Context) {
 
 	panel.Children(func() {
 		a.header(c, pal, snap.themeMode)
-		a.destination(c, pal)
-		if snap.launching {
-			statusBar(c, pal, "正在启动 Chrome…")
-		}
-		if snap.launchError != "" {
-			errorBanner(c, pal, "启动失败", snap.launchError+"；请重试，或确认 Chrome 已安装。")
-		}
+		a.destination(c, pal, snap)
 		if len(snap.profiles) == 0 {
 			emptyState(c, pal, snap.loadErr, func() {
 				a.reloadRequested = true
 				c.Invalidate()
 			})
 		} else {
-			a.profileList(c, pal, snap)
+			a.profileList(c, pal, snap, detailOpen)
 		}
-		a.footer(c, pal, len(snap.profiles))
 	})
 }
 
@@ -108,13 +108,14 @@ func (a *selectorApp) snapshot() snapshot {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	s := snapshot{
-		profiles:     a.profiles,
-		chosen:       a.chosen,
-		themeMode:    a.themeMode,
-		launching:    a.launching,
-		launchError:  a.launchError,
-		loadErr:      a.loadErr,
-		revealChosen: a.revealChosen,
+		profiles:           a.profiles,
+		chosen:             a.chosen,
+		themeMode:          a.themeMode,
+		launching:          a.launching,
+		launchError:        a.launchError,
+		loadErr:            a.loadErr,
+		revealChosen:       a.revealChosen,
+		reduceTransparency: a.reduceTransparency,
 	}
 	a.revealChosen = false
 	return s
@@ -143,29 +144,73 @@ func (a *selectorApp) handleKeys(c *ui.Context) bool {
 		return true
 	}
 
-	// 左右循环漫游，保留既有快捷键预期；上下改为相邻移动，符合竖向列表。
-	if c.Shortcut(0, ui.KeyRight) {
-		if n := (chosen + 1) % total; n != chosen {
-			a.setChosen(n)
-		}
-		c.Invalidate()
-	}
-	if c.Shortcut(0, ui.KeyLeft) {
-		if n := (chosen - 1 + total) % total; n != chosen {
-			a.setChosen(n)
-		}
-		c.Invalidate()
-	}
-	if c.Shortcut(0, ui.KeyDown) {
-		if chosen+1 < total {
-			a.setChosen(chosen + 1)
+	width, _ := c.Size()
+	cols := profileColumns(total, width)
+	grid := total > singleColumnLimit
+
+	if !grid {
+		// 1–4 个身份：单列列表保留左右循环漫游与上下相邻移动（既有预期）。
+		if c.Shortcut(0, ui.KeyRight) {
+			if n := (chosen + 1) % total; n != chosen {
+				a.setChosen(n)
+			}
 			c.Invalidate()
 		}
-	}
-	if c.Shortcut(0, ui.KeyUp) {
-		if chosen > 0 {
-			a.setChosen(chosen - 1)
+		if c.Shortcut(0, ui.KeyLeft) {
+			if n := (chosen - 1 + total) % total; n != chosen {
+				a.setChosen(n)
+			}
 			c.Invalidate()
+		}
+		if c.Shortcut(0, ui.KeyDown) {
+			if chosen+1 < total {
+				a.setChosen(chosen + 1)
+				c.Invalidate()
+			}
+		}
+		if c.Shortcut(0, ui.KeyUp) {
+			if chosen > 0 {
+				a.setChosen(chosen - 1)
+				c.Invalidate()
+			}
+		}
+	} else {
+		// 5+ 个身份：网格模式按列数二维导航。
+		// 左右在同行移动，边界停住；上下按列数跨行，下行短缺钳制到该行最后有效项，最后一行按下停住。
+		row := chosen / cols
+		col := chosen % cols
+		rows := panelRows(total, cols)
+		lastRow := rows - 1
+
+		if c.Shortcut(0, ui.KeyRight) {
+			if col < cols-1 && chosen+1 < total {
+				a.setChosen(chosen + 1)
+				c.Invalidate()
+			}
+		}
+		if c.Shortcut(0, ui.KeyLeft) {
+			if col > 0 {
+				a.setChosen(chosen - 1)
+				c.Invalidate()
+			}
+		}
+		if c.Shortcut(0, ui.KeyDown) {
+			if row < lastRow {
+				target := chosen + cols
+				if target >= total {
+					target = total - 1 // 下行短缺：钳制到末行最后一个有效项
+				}
+				a.setChosen(target)
+				c.Invalidate()
+			}
+			// row == lastRow 时按下停住，不触发 setChosen
+		}
+		if c.Shortcut(0, ui.KeyUp) {
+			if row > 0 {
+				a.setChosen(chosen - cols)
+				c.Invalidate()
+			}
+			// row == 0 时按上停住
 		}
 	}
 
@@ -180,243 +225,166 @@ func (a *selectorApp) handleKeys(c *ui.Context) bool {
 	return false
 }
 
-// header 是顶部一行：左上角关闭控件、克制的标题、右侧主题开关。
-// 整行可拖动窗口，因为窗口隐藏了标题栏。
+// header 是顶部一行：左侧关闭控件、右侧主题开关，没有标题也没有常驻说明。
+// 整行可拖动窗口，因为窗口隐藏了标题栏；高度固定，绝不因内容变化而增高。
 func (a *selectorApp) header(c *ui.Context, pal palette, mode ThemeMode) {
-	ui.Row(c).Height(22).AlignItems(ui.Center).DragWindow().Children(func() {
-		closeControl(c, pal, a.requestQuit)
+	ui.Row(c).
+		Key("header").
+		Height(menuHeaderHeight).
+		AlignItems(ui.Center).
+		DragWindow().
+		Shrink(0).
+		Children(func() {
+			closeControl(c, pal, a.requestQuit)
 
-		ui.Box(c).Width(8)
-		ui.Text(c, "Chrome Profile Router").
-			FontSize(10.5).
-			FontWeight(600).
-			LetterSpacing(0.4).
-			TextColor(pal.textMuted)
+			ui.Spacer(c)
 
-		ui.Spacer(c)
-
-		ui.Row(c).
-			Padding(2).
-			Gap(1).
-			Radius(7).
-			Background(pal.segBg).
-			Transition(fadeColors()).
-			Children(func() {
-				segment(c, "seg:auto", "系统", mode == ThemeAuto, pal, func() { a.setThemeMode(ThemeAuto, c) })
-				segment(c, "seg:light", "浅色", mode == ThemeLight, pal, func() { a.setThemeMode(ThemeLight, c) })
-				segment(c, "seg:dark", "深色", mode == ThemeDark, pal, func() { a.setThemeMode(ThemeDark, c) })
-			})
-	})
+			// 分段开关整体压在 22pt 以内：外框 1pt 内边距加 12pt 行高的
+			// 10pt 文字，保证控件不被 header 裁掉，也不把 header 撑高。
+			ui.Row(c).
+				Key("theme").
+				Padding(1).
+				Gap(1).
+				Radius(6).
+				Background(pal.segBg).
+				Transition(fadeColors()).
+				Shrink(0).
+				Children(func() {
+					segment(c, "seg:auto", "系统", mode == ThemeAuto, pal, func() { a.setThemeMode(ThemeAuto, c) })
+					segment(c, "seg:light", "浅色", mode == ThemeLight, pal, func() { a.setThemeMode(ThemeLight, c) })
+					segment(c, "seg:dark", "深色", mode == ThemeDark, pal, func() { a.setThemeMode(ThemeDark, c) })
+				})
+		})
 }
 
-// destination 显示即将打开的地址；队列里还有链接时说明剩余条数。
-func (a *selectorApp) destination(c *ui.Context, pal palette) {
-	host, pathStr, _ := parseURLDetails(a.targetURLForDisplay())
+// destination 是面板的视觉重点：一张整幅宽度的地址卡，域名以 24pt 粗体
+// 独占主行，路径、启动状态或失败原因写在独立的次行，队列剩余条数做成贴在
+// 主行右侧的小徽标。
+//
+// 高度固定为 menuDestinationHeight：任何状态都只替换次行文字，绝不新增一块
+// 卡片或撑高面板，因此错误与启动中不会挤压身份列表，也不会留下空白。
+// 整个区域可拖动窗口，同时悬停给出完整 URL（含 query 与 fragment）。
+func (a *selectorApp) destination(c *ui.Context, pal palette, snap snapshot) {
+	full := a.targetURLForDisplay()
+	host, pathStr, _ := parseURLDetails(full)
 	// 是否收到外部请求由队列本身判断，绝不与 HomeURL 做字符串比较。
 	hasPending := a.hasPendingRequests()
 
-	label := "目标地址"
-	if !hasPending {
-		label = "未收到外部链接 · 默认打开 Google"
-	}
-	note := ""
-	if n := a.pendingCount(); n > 1 {
-		note = fmt.Sprintf("队列剩余 %d 条", n)
+	// 本地文件没有域名：主行改用文件名，次行给出完整路径，避免 24pt 粗体
+	// 铺满一整条地址。网页地址仍以域名为主行。
+	mainLine, secondLine := host, pathStr
+	if rest, ok := strings.CutPrefix(full, "file://"); ok {
+		if decoded, err := url.PathUnescape(rest); err == nil {
+			rest = decoded
+		}
+		if i := strings.LastIndex(rest, "/"); i >= 0 && i+1 < len(rest) {
+			mainLine = rest[i+1:]
+		}
+		secondLine = rest
 	}
 
-	ui.Column(c).
+	// 次行优先级：失败原因 > 启动中 > 真实路径 > 未收到链接的说明。
+	// 失败原因用 danger 色，并在自己的 Tooltip 里给完整原文。
+	note, noteColor, noteTip := "", pal.textSecond, ""
+	switch {
+	case snap.launchError != "":
+		note = "启动失败：" + snap.launchError
+		noteColor = pal.danger
+		noteTip = snap.launchError + "；请重试，或确认 Chrome 已安装。"
+	case snap.launching:
+		note = "正在启动 Chrome…"
+	case secondLine != "" && secondLine != "/":
+		note = secondLine
+	case hasPending:
+		// 没有路径分量的地址（例如 https://example.com）：次行给出根路径，
+		// 保持与其它状态一致的视觉节奏。
+		note = "/"
+	default:
+		note = "未收到外部链接 · 默认打开主页"
+		noteColor = pal.textMuted
+	}
+
+	queueNote := ""
+	if n := a.pendingCount(); n > 1 {
+		queueNote = fmt.Sprintf("剩余 %d 条", n)
+	}
+
+	// 目标区是整幅宽度的地址卡：唯一带圆角、描边与轻投影的表面，因此它
+	// 而不是任何一张身份卡成为视觉第一优先。卡片高度固定，任何状态都只
+	// 替换次行文字，不改变几何。
+	box := ui.Column(c).
 		Key("destination").
-		Padding(9, 12).
-		Gap(2).
+		Height(menuDestinationHeight).
+		FillWidth().
+		Shrink(0).
+		Padding(10, 12).
+		Gap(3).
 		Radius(12).
 		Background(pal.destination).
 		Border(1, pal.border).
-		Shadow(0, 2, 10, 0, ui.RGBA(0, 0, 0, 0.06)).
-		Transition(fadeColors()).
-		Children(func() {
-			ui.Row(c).AlignItems(ui.Center).Gap(6).Children(func() {
-				ui.Box(c).Size(5, 5).Radius(2.5).Background(pal.accent)
-				ui.Text(c, label).
-					FontSize(9.5).
-					FontWeight(600).
-					LetterSpacing(0.3).
-					TextColor(pal.textMuted).
-					SingleLine()
-				ui.Spacer(c)
-				if note != "" {
-					ui.Text(c, note).FontSize(10).TextColor(pal.textMuted).SingleLine()
-				}
-			})
+		DragWindow().
+		Tooltip(full)
 
-			ui.Row(c).AlignItems(ui.Baseline).Gap(5).Children(func() {
-				ui.Text(c, host).
-					FontSize(15.5).
-					FontWeight(600).
-					TextColor(pal.textPrimary).
-					SingleLine()
-				if pathStr != "" && pathStr != "/" {
-					ui.Text(c, truncateRunes(pathStr, 34)).
-						FontSize(11).
-						TextColor(pal.textSecond).
-						SingleLine()
-				}
-			})
-		})
-}
-
-// profileList 渲染可滚动的身份列表。行高固定，超出窗口时滚动；
-// 键盘改变选择的那一帧把目标行滚入视野。
-func (a *selectorApp) profileList(c *ui.Context, pal palette, snap snapshot) {
-	canLaunch := !snap.launching
-	hovered := -1
-
-	list := ui.Scroll(c).Key("list").Grow(1)
-	list.Children(func() {
-		ui.Column(c).Gap(rowGap).Padding(0, 2).Children(func() {
-			for i, p := range snap.profiles {
-				idx := i
-				prof := p
-				isChosen := idx == snap.chosen
-
-				rowBg := pal.rowNormal
-				rowBorder := ui.Transparent
-				nameColor := pal.textPrimary
-				subColor := pal.textMuted
-				ringColor := pal.border
-				if isChosen {
-					rowBg = pal.rowChosen
-					rowBorder = pal.accent.Alpha(0.45)
-					nameColor = pal.accent
-					subColor = pal.textSecond
-					ringColor = pal.accent
-				}
-
-				row := ui.Row(c).
-					Key("row:"+prof.Dir).
-					Height(rowHeight).
-					Padding(0, 10).
-					Gap(9).
-					AlignItems(ui.Center).
-					Radius(10).
-					Background(rowBg).
-					Border(1, rowBorder).
-					Cursor(ui.CursorPointer).
-					Role(ui.RoleButton).
-					Label(prof.Name).
-					Transition(fadeColors())
-
-				// Hovered 只报告"指针在哪一行"，绝不在这里改选择：选择由
-				// trackPointer 根据指针是否真的移动决定。悬停底色是诚实的
-				// 指针反馈，静止时保持原样。
-				if row.Hovered() {
-					hovered = idx
-					if !isChosen {
-						row.Background(pal.rowHover)
-					}
-				}
-
-				// 按压反馈：短弹簧、可被打断，不改变任何布局。
-				press := float32(1)
-				if row.Pressed() {
-					press = 0.985
-				}
-				scale := row.AnimateTo("press", press, springPress())
-				row.Scale(scale, scale)
-
-				if snap.revealChosen && isChosen {
-					row.ScrollIntoView()
-				}
-
-				row.Children(func() {
-					ui.Row(c).
-						Size(28, 28).
-						Radius(14).
-						Center().
-						Border(1.25, ringColor).
-						Background(prof.Color.Alpha(0.16)).
-						Transition(fadeColors()).
-						Children(func() {
-							if prof.Avatar != nil {
-								ui.Image(c, prof.Avatar).Size(26, 26).Radius(13)
-							} else {
-								ui.Text(c, initialRune(prof.Name)).
-									FontSize(11.5).
-									FontWeight(600).
-									TextColor(prof.Color)
-							}
-						})
-
-					ui.Column(c).Grow(1).Gap(1).Children(func() {
-						ui.Text(c, prof.Name).
-							FontSize(12.5).
-							FontWeight(600).
-							TextColor(nameColor).
-							SingleLine()
-						sub := prof.Email
-						if sub == "" || sub == prof.Name {
-							sub = prof.Dir
-						}
-						ui.Text(c, truncateRunes(sub, 40)).
-							FontSize(10.5).
-							TextColor(subColor).
-							SingleLine()
-					})
-
-					if idx < 9 {
-						keyBg := pal.keycapBg
-						keyText := pal.keycapText
-						keyBorder := pal.border
-						if isChosen {
-							keyBg = pal.accent
-							keyText = ui.Hex("#FFFFFF")
-							keyBorder = pal.accent
-						}
-						ui.Row(c).
-							Size(18, 18).
-							Radius(5).
-							Center().
-							Background(keyBg).
-							Border(1, keyBorder).
-							Transition(fadeColors()).
-							Children(func() {
-								ui.Text(c, fmt.Sprintf("%d", idx+1)).
-									FontSize(9.5).
-									FontWeight(600).
-									TextColor(keyText)
-							})
-					}
-				})
-
-				if row.Clicked() && canLaunch {
-					a.openWith(prof)
-					return
-				}
-			}
-		})
-	})
-
-	// 指针坐标取列表容器内的局部坐标：内容滚动只改变偏移，不改变它，
-	// 所以滚动绝不能被误判成"指针进入了另一行"。
-	px, py, over := list.PointerPosition()
-	if a.trackPointer(hovered, px, py, over) {
-		// 本帧画的是 trackPointer 之前的选中项，补一帧让新选择显示出来。
-		c.Invalidate()
+	if !pal.opaque {
+		box.Shadow(0, 2, 9, 0, pal.cardShadow)
 	}
-}
 
-// footer 是最轻的键盘提示与身份计数。
-func (a *selectorApp) footer(c *ui.Context, pal palette, total int) {
-	ui.Row(c).Height(14).AlignItems(ui.Center).Children(func() {
-		ui.Text(c, "↑↓ 选择 · ↵ 打开 · 1–9 直达 · esc 退出").
-			FontSize(10).
-			TextColor(pal.textMuted).
-			SingleLine()
-		ui.Spacer(c)
-		if total > 0 {
-			ui.Text(c, fmt.Sprintf("%d 个身份", total)).
-				FontSize(10).
-				TextColor(pal.textMuted)
-		}
+	box.Children(func() {
+		// 主行：域名（24pt / 700，30pt 行高）。队列剩余条数只占主行右侧的
+		// 固定宽度，域名自身 Shrink + 省略，绝不与它挤成两段。
+		ui.Row(c).
+			Height(30).
+			AlignItems(ui.Center).
+			Gap(8).
+			Shrink(0).
+			Children(func() {
+				ui.Text(c, mainLine).
+					FontSize(24).
+					FontWeight(700).
+					FixedLineHeight(30).
+					LetterSpacing(-0.3).
+					TextColor(pal.textPrimary).
+					SingleLine().
+					Shrink(1).
+					MinWidth(0)
+				ui.Spacer(c)
+				if queueNote != "" {
+					ui.Row(c).
+						Padding(2, 7).
+						Radius(7).
+						Background(pal.shortcutBg).
+						Shrink(0).
+						Children(func() {
+							ui.Text(c, queueNote).
+								FontSize(10).
+								FontWeight(500).
+								TextColor(pal.textMuted).
+								SingleLine()
+						})
+				}
+			})
+
+		// 次行：路径 / 状态 / 错误，永远单行省略，高度固定。
+		ui.Row(c).
+			Height(15).
+			AlignItems(ui.Center).
+			Gap(5).
+			Shrink(0).
+			Children(func() {
+				if snap.launching && snap.launchError == "" {
+					ui.Spinner(c).Size(10, 10).TextColor(pal.accent).Shrink(0)
+				}
+				line := ui.Text(c, note).
+					FontSize(12.5).
+					TextColor(noteColor).
+					FixedLineHeight(15).
+					SingleLine().
+					Shrink(1).
+					MinWidth(0)
+				if noteTip != "" {
+					line.Tooltip(noteTip)
+				}
+			})
 	})
 }
 
@@ -426,11 +394,12 @@ func (a *selectorApp) footer(c *ui.Context, pal palette, total int) {
 
 // closeControl 是左上角的小关闭控件：两条交叉笔画，带无障碍名称。
 // 它无条件调用 requestQuit，因此在启动中、错误与空状态下都可用。
+// 边长等于 menuHeaderHeight，保证控件在 22pt 头部内完整显示而不被裁切。
 func closeControl(c *ui.Context, pal palette, onClose func()) {
 	btn := ui.Row(c).
 		Key("close").
-		Size(22, 22).
-		Radius(6).
+		Size(menuHeaderHeight, menuHeaderHeight).
+		Radius(5).
 		Center().
 		Background(ui.Transparent).
 		Cursor(ui.CursorPointer).
@@ -447,10 +416,10 @@ func closeControl(c *ui.Context, pal palette, onClose func()) {
 	}
 
 	btn.Children(func() {
-		ui.Box(c).Size(10, 10).Children(func() {
-			ui.Box(c).Absolute().Top(4.25).Left(0).Size(10, 1.5).Radius(0.75).
+		ui.Box(c).Size(9, 9).Children(func() {
+			ui.Box(c).Absolute().Top(3.75).Left(0).Size(9, 1.5).Radius(0.75).
 				Background(pal.glyph).Rotate(45)
-			ui.Box(c).Absolute().Top(4.25).Left(0).Size(10, 1.5).Radius(0.75).
+			ui.Box(c).Absolute().Top(3.75).Left(0).Size(9, 1.5).Radius(0.75).
 				Background(pal.glyph).Rotate(-45)
 		})
 	})
@@ -472,7 +441,7 @@ func segment(c *ui.Context, key any, label string, active bool, pal palette, onP
 
 	seg := ui.Row(c).
 		Key(key).
-		Padding(3, 7).
+		Padding(2, 6).
 		Radius(5).
 		Background(bg).
 		Cursor(ui.CursorPointer).
@@ -487,43 +456,12 @@ func segment(c *ui.Context, key any, label string, active bool, pal palette, onP
 	}
 
 	seg.Children(func() {
-		ui.Text(c, label).FontSize(10).FontWeight(500).TextColor(text)
+		ui.Text(c, label).FontSize(10).FontWeight(500).FixedLineHeight(12).TextColor(text)
 	})
 
 	if seg.Clicked() {
 		onPick()
 	}
-}
-
-// statusBar 渲染进行中提示：一个转动的指示器加一行说明。
-func statusBar(c *ui.Context, pal palette, label string) {
-	ui.Row(c).
-		Key("status").
-		Padding(7, 10).
-		Gap(8).
-		Radius(9).
-		Background(pal.rowNormal).
-		Border(1, pal.border).
-		AlignItems(ui.Center).
-		Children(func() {
-			ui.Spinner(c).Size(11, 11).TextColor(pal.accent)
-			ui.Text(c, label).FontSize(10.5).FontWeight(500).TextColor(pal.textSecond)
-		})
-}
-
-// errorBanner 渲染可读的失败原因，用户可原地重试。
-func errorBanner(c *ui.Context, pal palette, title, msg string) {
-	ui.Column(c).
-		Key("error").
-		Padding(8, 10).
-		Gap(2).
-		Radius(9).
-		Background(pal.rowNormal).
-		Border(1, pal.danger.Alpha(0.45)).
-		Children(func() {
-			ui.Text(c, title).FontSize(10.5).FontWeight(600).TextColor(pal.danger)
-			ui.Text(c, msg).FontSize(10).TextColor(pal.textSecond).SingleLine()
-		})
 }
 
 // emptyState 在无法识别任何身份时如实展示原因，并提供重新加载。
@@ -626,11 +564,30 @@ func (a *selectorApp) trackPointer(row int, px, py float32, over bool) bool {
 	return true
 }
 
-// setThemeMode 记录主题偏好并请求重绘。
+// setReduceTransparency 记录系统"降低透明度"偏好，主线程调用。
+func (a *selectorApp) setReduceTransparency(v bool) {
+	a.mu.Lock()
+	a.reduceTransparency = v
+	a.mu.Unlock()
+}
+
+// setThemeMode 同步界面与原生磨砂外观，避免文字与材质使用相反的主题。
 func (a *selectorApp) setThemeMode(m ThemeMode, c *ui.Context) {
 	a.mu.Lock()
 	a.themeMode = m
+	w := a.window
 	a.mu.Unlock()
+	if w != nil {
+		source := mygo.ThemeSystem
+		switch m {
+		case ThemeLight:
+			source = mygo.ThemeLight
+		case ThemeDark:
+			source = mygo.ThemeDark
+		}
+		// 主题变更会重绘原生表面，放到下一轮主线程以避免渲染中途重入。
+		w.Update(func() { mygo.Theme.SetSource(source) })
+	}
 	c.Invalidate()
 }
 
