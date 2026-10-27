@@ -27,7 +27,7 @@ type palette struct {
 	// 出现浑浊的灰边。
 	opaque bool
 
-	window      ui.Color // 根背景以主题色覆在原生材质之上；0.80 的覆盖是为文字可读性选定的适配值，材质仍负责模糊
+	window      ui.Color // 根背景以主题色薄层覆在原生材质之上；模糊由材质负责，覆盖只压底噪，文字对比主要靠地址卡
 	destination ui.Color // 顶部目标地址卡
 	popover     ui.Color // 空格详情浮层：比地址卡更实，保证压在卡片上仍可读
 	cardShadow  ui.Color // 身份卡片的极浅投影：悬停与地址卡使用；选中卡改用两级柔光，不再用它
@@ -72,8 +72,8 @@ func newPalette(dark, vibrancy, highContrast, reduceTransparency bool) palette {
 	p := palette{opaque: opaque}
 	if dark {
 		p.textPrimary = ui.Hex("#F2F4F8")
-		p.textSecond = ui.Hex("#CDD3DE")
-		p.textMuted = ui.Hex("#AEB6C2")
+		p.textSecond = ui.Hex("#D8DEE9")
+		p.textMuted = ui.Hex("#BCC4D0")
 		p.textOnChosen = ui.Hex("#CDD3DE")
 		p.accent = ui.Hex("#4C9AFF")
 		p.danger = ui.Hex("#FF6B5E")
@@ -91,9 +91,9 @@ func newPalette(dark, vibrancy, highContrast, reduceTransparency bool) palette {
 			p.cardShadow = ui.Transparent
 			p.popShadow = ui.RGBA(0, 0, 0, 0.32)
 		} else {
-			p.window = ui.RGBA(22, 24, 29, 0.80)
-			p.destination = ui.RGBA(30, 34, 41, 0.72)
-			p.popover = ui.RGBA(30, 34, 41, 0.78)
+			p.window = ui.RGBA(22, 24, 29, 0.30)
+			p.destination = ui.RGBA(30, 34, 41, 0.62)
+			p.popover = ui.RGBA(30, 34, 41, 0.72)
 			p.rowNormal = ui.RGBA(255, 255, 255, 0.032)
 			p.rowHover = ui.RGBA(255, 255, 255, 0.075)
 			p.rowChosen = ui.RGBA(76, 154, 255, 0.18)
@@ -142,9 +142,9 @@ func newPalette(dark, vibrancy, highContrast, reduceTransparency bool) palette {
 		p.cardShadow = ui.Transparent
 		p.popShadow = ui.RGBA(0, 0, 0, 0.18)
 	} else {
-		p.window = ui.RGBA(246, 246, 247, 0.80)
-		p.destination = ui.RGBA(255, 255, 255, 0.72)
-		p.popover = ui.RGBA(255, 255, 255, 0.92)
+		p.window = ui.RGBA(246, 246, 247, 0.34)
+		p.destination = ui.RGBA(255, 255, 255, 0.66)
+		p.popover = ui.RGBA(255, 255, 255, 0.82)
 		p.rowNormal = ui.RGBA(255, 255, 255, 0.10)
 		p.rowHover = ui.RGBA(255, 255, 255, 0.34)
 		p.rowChosen = ui.RGBA(37, 99, 235, 0.12)

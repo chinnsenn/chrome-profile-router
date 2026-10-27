@@ -3,6 +3,7 @@ build/
 dist/
 *.app
 *.dmg
+/chrome-profile-router
 
 # OS generated files
 .DS_Store
