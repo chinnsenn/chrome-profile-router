@@ -33,18 +33,34 @@ const (
 	chosenSpinPeriod      = 6 * time.Second // BorderBeam duration 原值
 	chosenBaseBorderAlpha = 0.55            // 现有选中边框 accent α，作预合成底
 
-	// Pow GlowEffect：amount 照搬原值；base radius 是适配值（Pow 默认 16）。
-	// 离屏观感显示 R=4 时只有最外一圈约 46 像素有可见差异、几乎读不出辉光，
-	// 因此取 16 的一半即 8，让内两级落在 1.4 / 2.8pt。仍只取半径公式的内两级。
+	// Pow GlowEffect：amount 照搬原值，只取半径公式的内两级；base radius 与
+	// gain 都是按真机像素调出来的适配值，不冒充来源原值。
+	//
+	// 阴影模糊按 sigma = blur/2 衰减，边外 d pt 处的 alpha ≈
+	// gain·sqrt(amount)/div·Q(d/sigma)，所以「看得见」由半径与 gain 共同决定，
+	// 只加 gain 只会做出一圈硬边。两次真机迭代（窗口截图按桌面整屏裁剪、以同一
+	// 张卡选中/未选中同像素相减取值，见 /tmp/chrome-router-gui-evidence/
+	// live-verification.md）：
+	//
+	//   - 旧值 R=8 / gain=0.45（内两级 1.4 / 2.8pt）：底边外 2px 只差 2–5 级，
+	//     深色主题 1–3 级，读不出辉光。
+	//   - 第一次 R=18 / gain=0.55：浅色底边外 2/3/4/5px = 33/25/15/11 级达标，
+	//     深色 24/17/12/7 级，最外一档仍不足 8 级。
+	//   - 现值 R=19 / gain=0.62（内两级 3.325 / 6.650pt，sigma 1.6625 / 3.325）：
+	//     浅色 2/3/4/5px = 27/20/13/9 级，深色 20/14/10/5 级；6pt 卡间距中线
+	//     浅色 6 / 深色 4 级，邻卡自身像素 0–1 级（不污染邻居）。深色最外一档
+	//     仍低于 8 级：主题 accent #4C9AFF 与深色底的通道差上限约 155，比浅色
+	//     accent 的约 198 小，同一 alpha 下尾巴天然更弱；再加大 gain 会让浅色
+	//     近边变成硬边，因此停在这里，不为了数字牺牲观感。
 	glowAmount     = 0.7
-	glowBaseRadius = 8.0  // 适配值，非 Pow 原默认 16
-	glowGain       = 0.45 // 全量 alpha 过亮，整体下调；1.2:4 的比例不变
+	glowBaseRadius = 19.0 // 适配值（Pow 默认 16）；内两级由此派生 3.325 / 6.650pt
+	glowGain       = 0.62 // 适配值：让近边 alpha 落在 0.43 / 0.13
 )
 
 // 内两级半径：amount*r/4 与 amount*r/2。
 const (
-	chosenGlowInnerRadius = glowAmount * glowBaseRadius / 4 // 1.40
-	chosenGlowOuterRadius = glowAmount * glowBaseRadius / 2 // 2.80
+	chosenGlowInnerRadius = glowAmount * glowBaseRadius / 4 // 3.325
+	chosenGlowOuterRadius = glowAmount * glowBaseRadius / 2 // 6.650
 )
 
 // chosenStopPositions 是 Stripe 原值，顺序与长度不可随意改。
