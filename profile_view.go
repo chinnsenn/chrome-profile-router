@@ -1,6 +1,6 @@
-// [INPUT]: 依赖 selectorApp 的状态快照、ui 包与 view_style.go 的调色板；卡片高度、间距、头像与徽标尺寸来自 layout.go；悬停倾斜与内层视差来自 card_motion.go 的 cardTilt。
-// [OUTPUT]: 渲染身份卡片画廊——1–4 个身份的 56pt 单列卡与 5+ 的 60pt 三列网格卡（身份色细条、32pt 真实头像、13.5pt 名称、11.5pt 邮箱、数字键徽标）。每张卡拆成两层：外壳是纯命中盒，承载 Key / Height / AlignItems / Radius / Shrink / Cursor / Role / Label / Description / Tooltip / Hovered / Pressed / Clicked / ScrollIntoView 与点击启动、按压弹簧，不绘制任何像素；内层是可见表面，承载 Padding / Gap / Radius / Border / Background / Shadow 与全部内容，并接受悬停 3D 倾斜和内层视差，因此外壳盒子不随倾斜移动。另提供无障碍描述、悬停 Tooltip 与空格详情浮层。
-// [POS]: 根包的视图层分片，专管身份项呈现；状态写入与事件调度仍在 view.go，倾斜与视差的参数与变换链在 card_motion.go。
+// [INPUT]: 依赖 selectorApp 的状态快照、ui 包与 view_style.go 的调色板；卡片高度、间距、头像与徽标尺寸来自 layout.go；悬停倾斜与内层视差来自 card_motion.go 的 cardTilt；悬停放大与邻居让位的几何来自 hover_layout.go 的 hoverLayout。
+// [OUTPUT]: 渲染身份卡片画廊——1–4 个身份的 56pt 单列卡与 5+ 的 60pt 网格卡（身份色细条、32pt 真实头像、13.5pt 名称、11.5pt 邮箱、数字键徽标）。每张卡拆成三层：slot 是稳定布局盒，承载 Height / Shrink / FillWidth / ScrollIntoView，从不加变换；layer 是交互层，承载 Key / 命中 / Cursor / Role / Label / Description / Tooltip / Hovered / Pressed / Clicked 与悬停放大、邻居让位、按压弹簧，因命中测试会逆变换指针，放大出来的边缘同样可点；surface 是可见表面，承载 Padding / Gap / Radius / Border / Background / Shadow 与全部内容，并接受悬停 3D 倾斜与内层视差。另提供无障碍描述、悬停 Tooltip 与空格详情浮层。
+// [POS]: 根包的视图层分片，专管身份项呈现；状态写入与事件调度仍在 view.go，倾斜与视差的参数与变换链在 card_motion.go，空间再分配在 hover_layout.go。
 // [PROTOCOL]: 变更时更新此头部，然后检查 AGENTS.md
 package main
 
@@ -10,39 +10,67 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
-// profileList 渲染可滚动的身份列表。1–4 个身份用单列卡片，5 个起按窗口
-// 宽度铺三列网格卡片；两种模式渲染同一个卡片结构，只是高度与容器不同。
-// 键盘改变选择的那一帧把目标项滚入视野。
+// profileList 渲染可滚动的身份列表，启动动作固定为 openWith。
+//
+// 1–4 个身份用单列卡片，5 个起按窗口宽度铺网格卡片；两种模式渲染同一个
+// 卡片结构，只是高度与容器不同。键盘改变选择的那一帧把目标项滚入视野。
 func (a *selectorApp) profileList(c *ui.Context, pal palette, snap snapshot, detailOpen *bool) {
-	canLaunch := !snap.launching
-	hovered := -1
+	a.profileListWith(c, pal, snap, detailOpen, a.openWith)
+}
+
+// profileListWith 是 profileList 的实现，启动动作由调用方给出。
+//
+// 生产路径永远传 a.openWith；测试传记录用的回调，这样点击语义（点到的究竟
+// 是哪一张卡）可以在不启动任何系统进程的前提下被断言。这里没有全局可变的
+// launcher，也不改变 openWith 本身的行为。
+func (a *selectorApp) profileListWith(c *ui.Context, pal palette, snap snapshot, detailOpen *bool, launch func(Profile)) {
 	total := len(snap.profiles)
 	width, _ := c.Size()
 	grid := total > singleColumnLimit
 	itemGap := panelItemGap(total)
 	itemHeight := panelItemHeight(total)
 
+	cols := 1
+	if grid {
+		cols = profileColumns(total, width)
+	}
+
 	var chosenAnchor ui.Element
 
+	list := ui.Scroll(c).Key("list").Grow(1)
+	gallery := ui.Local(list, "hoverGallery", func() hoverGallery {
+		return hoverGallery{}
+	})
+
+	// 悬停归属只看「根坐标指针」与「上一帧的几何」，绝不读交互层的
+	// Hovered()：命中盒带着放大变换，动画帧本身就能让它在"在卡上/不在卡上"
+	// 之间摆动，把悬停切走。判定顺序是上一帧的可见矩形（已让位、互不相交，
+	// 放大出来的那一圈只属于放大它的那张卡）→ 上一帧的静止布局盒（首帧兜底）。
+	px, py, _ := c.Root().PointerPosition()
+	_, _, over := list.PointerPosition()
+	hovered := -1
+	if over {
+		hovered = gallery.hoverAt(px, py)
+	}
+
 	// 两种容器共用同一段填充逻辑：顺序、选择、悬停与锚点完全一致。
+	// slot/layer 句柄只在本帧有效，缓冲由 gallery 复用。
+	slots, layers, pressed := gallery.elements(total)
 	items := func() {
 		for i, p := range snap.profiles {
-			el, hov := a.profileItem(c, pal, snap, p, i, i == snap.chosen, canLaunch, itemHeight)
-			if hov {
-				hovered = i
-			}
+			slot, layer, down := a.profileItem(c, pal, snap, p, i, i == snap.chosen, !snap.launching, hovered == i, launch, itemHeight)
+			slots[i], layers[i], pressed[i] = slot, layer, down
 			if i == snap.chosen {
-				chosenAnchor = el
+				chosenAnchor = slot
 			}
 		}
 	}
 
-	list := ui.Scroll(c).Key("list").Grow(1)
 	list.Children(func() {
 		if grid {
 			ui.Grid(c).
 				Key("grid").
-				Columns(profileColumns(total, width)).
+				Columns(cols).
 				Gap(itemGap).
 				Padding(listShadowPad, listInset).
 				Children(items)
@@ -55,20 +83,50 @@ func (a *selectorApp) profileList(c *ui.Context, pal palette, snap snapshot, det
 			Children(items)
 	})
 
-	// 键盘用户查看完整值：按空格打开/收起选中身份的详情浮层。
-	// 浮层以选中项为锚点，宽度受窗口限制，名称与邮箱自动换行完整可读。
-	// 浮层通过 Overlay 呈现，避免拦截 Escape 键，保证全时按 Esc 优先退出。
+	// 悬停放大与邻居让位：整条带一起算，因为放大必须在同带邻居之间重新
+	// 分配空间。入参是各卡的静止布局盒（slot 从不加变换，LayoutBounds 就是
+	// 静止盒子），结果写进本帧缓冲。悬停索引为 -1 时全部回到静止值，离开
+	// 因此是平滑复位而不是停在放大状态。
+	//
+	// 变换只施加给**交互层**：它与可见表面严格重合，MyGo 的命中测试会逆变换
+	// 指针坐标，所以放大出来的边缘同样可点；slot 保持不动，滚动定位与详情
+	// 浮层锚点因此不受动画影响。
+	rects := gallery.rects(total)
+	for i := range rects {
+		rects[i] = slots[i].LayoutBounds()
+	}
+	shifts := gallery.shifts(total)
+	hoverLayout(shifts, rects, cols, itemGap, hovered, c.Preferences().ReduceMotion)
+	visible := gallery.visible(total)
+	for i := range layers {
+		press := float32(1)
+		if pressed[i] {
+			press = 0.98
+		}
+		press = layers[i].AnimateTo("press", press, springPress())
+		shift := hoverShift{
+			SX: layers[i].AnimateTo("hoverSX", shifts[i].SX, cardTiltSpring()),
+			SY: layers[i].AnimateTo("hoverSY", shifts[i].SY, cardTiltSpring()),
+			DX: layers[i].AnimateTo("hoverDX", shifts[i].DX, cardTiltSpring()),
+			DY: layers[i].AnimateTo("hoverDY", shifts[i].DY, cardTiltSpring()),
+		}
+		visible[i] = visibleRect(rects[i], shift)
+		if press == 1 && shift == (hoverShift{SX: 1, SY: 1}) {
+			continue // 静止：不设变换，不为常态付任何绘制代价。
+		}
+		layers[i].Transform(hoverTransform(shift).Then(ui.Scaling(press, press)))
+	}
+	gallery.record(rects, visible)
+
 	if detailOpen != nil && *detailOpen && chosenAnchor != (ui.Element{}) && snap.chosen >= 0 && snap.chosen < total {
 		profileDetail(c, pal, snap.profiles[snap.chosen], snap.chosen, chosenAnchor, width)
 	}
 
 	// 指针坐标必须取根元素（= 窗口坐标）：列表容器的局部坐标会被祖先的
-	// 变换逐帧改写——面板进出场的 scale/translate 与卡片倾斜都在改变换，
-	// 静止的指针会因此每帧算出不同的局部坐标，被误判成"真实移动"并覆盖
-	// 键盘选择。根元素不带任何变换，坐标稳定；"指针是否在列表视口内"仍由
-	// 列表容器判定（它随面板缩放，这是正确的命中语义）。
-	px, py, _ := c.Root().PointerPosition()
-	_, _, over := list.PointerPosition()
+	// 变换逐帧改写——面板进出场的 scale/translate 都在改变换，静止的指针
+	// 会因此每帧算出不同的局部坐标，被误判成"真实移动"并覆盖键盘选择。
+	// 根元素不带任何变换，坐标稳定；"指针是否在列表视口内"仍由列表容器
+	// 判定（它随面板缩放，这是正确的命中语义）。
 	if a.trackPointer(hovered, px, py, over) {
 		// 本帧画的是 trackPointer 之前的选中项，补一帧让新选择显示出来。
 		c.Invalidate()
@@ -139,25 +197,29 @@ func profileDetail(c *ui.Context, pal palette, prof Profile, idx int, anchor ui.
 // 时为首字母），中间名称 (13.5pt/600) 与邮箱/Dir (11.5pt) 两行，右侧 1–9
 // 数字键徽标。height 由 layout.go 给出（单列 56pt，网格 60pt）。
 //
-// 卡片分两层，且"可见表面"整体在倾斜层里：
-//   - 外层是纯命中盒：Key、命中区域、按下缩放、滚动定位、详情浮层锚点、
-//     无障碍标签、Tooltip 都在它身上；它完全透明，绝不做 3D 变换。
-//   - 内层是卡片表面本身：背景、1pt 描边、投影、圆角与全部内容，悬停时
-//     整块接受倾斜。因为表面和内容一起转，内容永远不会越出自己的边框——
-//     这正是 CSS tilt 的语义；若只倾斜内容而让表面保持平直，文字与身份色
-//     细条就会在卡片边缘外露出来。
+// 卡片分三层，三层严格等大，只有中间一层接收悬停放大：
+//   - slot 是稳定布局盒：Height、Shrink、ScrollIntoView 在它身上，从不加
+//     任何变换，所以网格、滚动位置与详情浮层锚点都只由布局决定。
+//   - layer 是交互层：Key、命中形状、Cursor、Role/Label/Description、
+//     Tooltip、Hovered/Pressed/Clicked 都在它身上，并承载悬停放大与邻居让位
+//     的缩放/位移。MyGo 的命中测试会逆变换指针坐标，所以放大出来的边缘同样
+//     可点、可悬停——点到的永远是看见的那张卡。
+//   - surface 是可见表面：背景、1pt 描边、投影、圆角与全部内容，整块接受
+//     5.5° 倾斜。表面与内容一起转，内容永远不会越出自己的边框；若只倾斜
+//     内容而让表面保持平直，文字与身份色细条就会在卡片边缘外露出来。
 //
-// 内层用 Fill() 填满外壳的 border-box，两者严格等大，所以布局、命中区、
-// 锚点与滚动位置完全不变。内边距只放在内层：外壳若也留 Padding(0,8)，
-// 内层就会被再缩进 8pt，卡片表面跟着变窄。
+// 内边距只放在 surface：slot 与 layer 若也留 Padding(0,8)，表面会被再缩进
+// 8pt，卡片表面跟着变窄。
 //
-// 卡片常态是几乎不可见的薄底加 1pt 透明描边：九个身份因此读作一张材质
-// 上的画廊，而不是九块玻璃。悬停只提亮底色并加一层极浅投影，选中用主题色
-// 薄底、主题色细边与实心数字徽标；两者都不改变任何几何尺寸，也都不做颜色
-// 过渡——键盘选择必须在按下的那一帧就可见，不能靠动画补上反馈。
-// 长名称与邮箱通过 Tooltip 悬停或空格详情浮层查看完整值。
-// 返回元素及它是否被指针悬停。
-func (a *selectorApp) profileItem(c *ui.Context, pal palette, snap snapshot, prof Profile, idx int, isChosen, canLaunch bool, height float32) (ui.Element, bool) {
+// 卡片常态是几乎不可见的薄底加 1pt 透明描边：九个身份因此读作一张材质上的
+// 画廊，而不是九块玻璃。悬停只提亮底色并加一层极浅投影，选中用主题色薄底、
+// 主题色细边与实心数字徽标；两者都不做颜色过渡——键盘选择必须在按下的那一
+// 帧就可见，不能靠动画补上反馈。长名称与邮箱通过 Tooltip 悬停或空格详情
+// 浮层查看完整值。
+//
+// 返回稳定 slot、交互层、是否被指针悬停、是否处于按下状态。按下与悬停的
+// 动画通道都由 profileList 统一施加（整条带要一起算空间分配）。
+func (a *selectorApp) profileItem(c *ui.Context, pal palette, snap snapshot, prof Profile, idx int, isChosen, canLaunch, hovered bool, launch func(Profile), height float32) (slot, layer ui.Element, pressed bool) {
 	sub := profileSubtitle(prof)
 	fullTip := prof.Name
 	if sub != "" && sub != prof.Name {
@@ -175,124 +237,126 @@ func (a *selectorApp) profileItem(c *ui.Context, pal palette, snap snapshot, pro
 		ringColor = pal.accent
 	}
 
-	// 外壳：纯命中盒。Radius 只用于命中形状与无障碍描述，不画任何像素。
-	item := ui.Row(c).
-		Key("row:"+prof.Dir).
+	// slot：纯布局盒，不画像素、不做变换。
+	//
+	// PassThrough 让 slot 退出命中登记：命中按"布局盒"登记，slot 的盒子不随
+	// 放大移动，会盖住前一张卡伸过来的那一圈区域（放大 6% 的一半正好超过
+	// 6pt 间距），使点击落到邻居的空 slot 上。退出登记后，命中只由已变换的
+	// 交互层决定，可见边缘与可点边缘严格一致。
+	slot = ui.Row(c).
+		Key("slot:" + prof.Dir).
 		Height(height).
 		AlignItems(ui.Center).
-		Radius(profileCardRadius).
 		Shrink(0).
-		Cursor(ui.CursorPointer).
-		Role(ui.RoleButton).
-		Label(prof.Name).
-		Description(sub).
-		Tooltip(fullTip)
+		PassThrough()
 
-	// 悬停/选中的判断仍读外壳：命中与交互语义只在外壳上。样式写到内层
-	// 表面，随倾斜一起转。
-	isHovered := false
-	if item.Hovered() {
-		isHovered = true
-		if !isChosen {
+	// layer 与 surface 都必须建在 slot 内部，否则它们会成为网格/列的直接
+	// 子元素，拿到的是整行宽高而不是卡片自己的格子。
+	slot.Children(func() {
+		// layer：交互层。命中与交互语义只在这里；样式写到 surface。
+		layer = ui.Row(c).
+			Key("row:" + prof.Dir).
+			Fill().
+			AlignItems(ui.Center).
+			Radius(profileCardRadius).
+			Cursor(ui.CursorPointer).
+			Role(ui.RoleButton).
+			Label(prof.Name).
+			Description(sub).
+			Tooltip(fullTip)
+
+		// 悬停归属由 profileList 依据静止布局与指针坐标判定后传入；交互层
+		// 自己的 Hovered() 会随放大变换摆动，不能作为悬停源。
+		pressed = layer.Pressed()
+		if hovered && !isChosen {
 			// 悬停只提亮底色并加一层极浅投影，不出现第二张卡片的体积感。
 			rowBg = pal.rowHover
 			rowBorder = pal.border
 		}
-	}
-	var surfaceShadow ui.Color
-	if isHovered && !isChosen && !pal.opaque {
-		surfaceShadow = pal.cardShadow
-	}
-	if isChosen && !pal.opaque {
-		// 选中比悬停再高一档：主题色薄底之外，一层更宽的软投影把它从
-		// 相邻卡片里托起来。阴影不参与布局，因此不会推动网格。
-		surfaceShadow = pal.cardShadow
-	}
-
-	// 按压反馈：短弹簧、可被打断，只动缩放，不改变任何布局。它与悬停
-	// 倾斜是两条独立的通道：按下不参与 tilt 变换链，tilt 也不改写它。
-	press := float32(1)
-	if item.Pressed() {
-		press = 0.98
-	}
-	scale := item.AnimateTo("press", press, springPress())
-	item.Scale(scale, scale)
-
-	if snap.revealChosen && isChosen {
-		item.ScrollIntoView()
-	}
-
-	// 倾斜作用于内层表面；动画通道挂在外壳上，跨帧保持同一个元素。
-	tilt, shiftX, shiftY := cardTilt(item, c)
-	// 徽标是最靠边缘的元素，视差略强一档，与 Atropos children 的深度差
-	// 一致；两个位移都取反，得到与倾斜方向相反的视差。
-	badgeShiftX, badgeShiftY := shiftX*cardParallaxBadgeRatio, shiftY*cardParallaxBadgeRatio
-
-	item.Children(func() {
-		// 内层：卡片表面 + 内容。没有任何交互语义（无 Key、无 Role、
-		// 无事件），因此倾斜不会改变命中区域。
-		surface := ui.Row(c).
-			Fill().
-			Padding(0, 8).
-			Gap(6).
-			AlignItems(ui.Center).
-			Radius(profileCardRadius).
-			Background(rowBg).
-			Border(1, rowBorder).
-			Transform(tilt)
-		if surfaceShadow.A > 0 {
-			if isChosen {
-				surface.Shadow(0, 2, 6, 0, surfaceShadow)
-			} else {
-				surface.Shadow(0, 1, 3, 0, surfaceShadow)
-			}
+		var surfaceShadow ui.Color
+		if hovered && !isChosen && !pal.opaque {
+			surfaceShadow = pal.cardShadow
+		}
+		if isChosen && !pal.opaque {
+			// 选中比悬停再高一档：主题色薄底之外，一层更宽的软投影把它从
+			// 相邻卡片里托起来。阴影不参与布局，因此不会推动网格。
+			surfaceShadow = pal.cardShadow
 		}
 
-		surface.Children(func() {
-			// 身份色细条：把真实 Profile 颜色带进卡片，是除头像外唯一的
-			// 个性标识。选中时它保持本色，不随主题色改变。
-			ui.Box(c).
-				Width(profileAccentBarWidth).
-				Height(profileAccentBarHeight).
-				Radius(profileAccentBarWidth / 2).
-				Background(prof.Color.Alpha(0.85)).
-				Shrink(0)
+		if snap.revealChosen && isChosen {
+			slot.ScrollIntoView()
+		}
 
-			// 头像与文字列同向位移；它们是表面的子元素，独立变换与表面
-			// 的倾斜自然组合，不会互相覆盖。
-			profileAvatar(c, prof, ringColor, profileAvatarSize, profileAvatarSize/2).
-				Transform(ui.Translation(-shiftX, -shiftY))
+		// 倾斜作用于 surface；动画通道挂在 layer 上，跨帧保持同一个元素。
+		tilt, shiftX, shiftY := cardTilt(layer, c)
+		// 徽标是最靠边缘的元素，视差略强一档，与 Atropos children 的深度差
+		// 一致；两个位移都取反，得到与倾斜方向相反的视差。
+		badgeShiftX, badgeShiftY := shiftX*cardParallaxBadgeRatio, shiftY*cardParallaxBadgeRatio
 
-			ui.Column(c).Grow(1).Gap(2).MinWidth(0).
-				Transform(ui.Translation(-shiftX, -shiftY)).
-				Children(func() {
-					ui.Text(c, prof.Name).
-						FontSize(profileNameSize).
-						FontWeight(600).
-						TextColor(pal.textPrimary).
-						SingleLine().
-						Shrink(1).
-						MinWidth(0)
-
-					ui.Text(c, sub).
-						FontSize(profileEmailSize).
-						TextColor(subColor).
-						SingleLine().
-						Shrink(1).
-						MinWidth(0)
-				})
-
-			if idx < 9 {
-				profileShortcut(c, pal, idx, isChosen).
-					Transform(ui.Translation(-badgeShiftX, -badgeShiftY))
+		layer.Children(func() {
+			surface := ui.Row(c).
+				Fill().
+				Padding(0, 8).
+				Gap(6).
+				AlignItems(ui.Center).
+				Radius(profileCardRadius).
+				Background(rowBg).
+				Border(1, rowBorder).
+				Transform(tilt)
+			if surfaceShadow.A > 0 {
+				if isChosen {
+					surface.Shadow(0, 2, 6, 0, surfaceShadow)
+				} else {
+					surface.Shadow(0, 1, 3, 0, surfaceShadow)
+				}
 			}
+
+			surface.Children(func() {
+				// 身份色细条：把真实 Profile 颜色带进卡片，是除头像外唯一的
+				// 个性标识。选中时它保持本色，不随主题色改变。
+				ui.Box(c).
+					Width(profileAccentBarWidth).
+					Height(profileAccentBarHeight).
+					Radius(profileAccentBarWidth / 2).
+					Background(prof.Color.Alpha(0.85)).
+					Shrink(0)
+
+				// 头像与文字列同向位移；它们是表面的子元素，独立变换与表面
+				// 的倾斜自然组合，不会互相覆盖。
+				profileAvatar(c, prof, ringColor, profileAvatarSize, profileAvatarSize/2).
+					Transform(ui.Translation(-shiftX, -shiftY))
+
+				ui.Column(c).Grow(1).Gap(2).MinWidth(0).
+					Transform(ui.Translation(-shiftX, -shiftY)).
+					Children(func() {
+						ui.Text(c, prof.Name).
+							FontSize(profileNameSize).
+							FontWeight(600).
+							TextColor(pal.textPrimary).
+							SingleLine().
+							Shrink(1).
+							MinWidth(0)
+
+						ui.Text(c, sub).
+							FontSize(profileEmailSize).
+							TextColor(subColor).
+							SingleLine().
+							Shrink(1).
+							MinWidth(0)
+					})
+
+				if idx < 9 {
+					profileShortcut(c, pal, idx, isChosen).
+						Transform(ui.Translation(-badgeShiftX, -badgeShiftY))
+				}
+			})
 		})
 	})
 
-	if item.Clicked() && canLaunch {
-		a.openWith(prof)
+	if layer.Clicked() && canLaunch {
+		launch(prof)
 	}
-	return item, isHovered
+	return slot, layer, pressed
 }
 
 // profileSubtitle 提取身份的第二行副文本：优先邮箱，空或与名称重复时回退为目录名。

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"image"
 	"image/color"
-	"math"
 	"testing"
 	"time"
 
@@ -33,9 +32,9 @@ func TestCardTiltTargetZeroWhenInactive(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			rx, ry, s, sx, sy := cardTiltTarget(tc.px, tc.py, tc.w, tc.h, tc.over, tc.reduceMotion)
-			if rx != 0 || ry != 0 || s != 1 || sx != 0 || sy != 0 {
-				t.Fatalf("inactive card must have no tilt: rotX=%v rotY=%v scale=%v shiftX=%v shiftY=%v", rx, ry, s, sx, sy)
+			rx, ry, sx, sy := cardTiltTarget(tc.px, tc.py, tc.w, tc.h, tc.over, tc.reduceMotion)
+			if rx != 0 || ry != 0 || sx != 0 || sy != 0 {
+				t.Fatalf("inactive card must have no tilt: rotX=%v rotY=%v shiftX=%v shiftY=%v", rx, ry, sx, sy)
 			}
 		})
 	}
@@ -47,8 +46,8 @@ func TestCardTiltTargetZeroWhenInactive(t *testing.T) {
 func TestCardTiltTargetFollowsPointer(t *testing.T) {
 	const w, h = 200, 56
 
-	rxTL, ryTL, sTL, sxTL, syTL := cardTiltTarget(0, 0, w, h, true, false)
-	rxBR, ryBR, sBR, sxBR, syBR := cardTiltTarget(w, h, w, h, true, false)
+	rxTL, ryTL, sxTL, syTL := cardTiltTarget(0, 0, w, h, true, false)
+	rxBR, ryBR, sxBR, syBR := cardTiltTarget(w, h, w, h, true, false)
 	if !(ryTL > 0 && rxTL < 0) {
 		t.Fatalf("top-left must tilt its left and top edges toward the viewer: rotX=%v rotY=%v", rxTL, ryTL)
 	}
@@ -58,21 +57,18 @@ func TestCardTiltTargetFollowsPointer(t *testing.T) {
 	if rxTL != -rxBR || ryTL != -ryBR {
 		t.Fatalf("opposite corners must be symmetric: TL=(%v,%v) BR=(%v,%v)", rxTL, ryTL, rxBR, ryBR)
 	}
-	if sTL != cardHoverScale || sBR != cardHoverScale {
-		t.Fatalf("hover must scale by %v: got %v and %v", cardHoverScale, sTL, sBR)
-	}
 	if !(sxTL < 0 && syTL < 0 && sxBR > 0 && syBR > 0) {
 		t.Fatalf("parallax must follow the pointer side: TL=(%v,%v) BR=(%v,%v)", sxTL, syTL, sxBR, syBR)
 	}
 
-	// 中心：没有角度，但悬停缩放仍然存在。
-	if rx, ry, s, sx, sy := cardTiltTarget(w/2, h/2, w, h, true, false); rx != 0 || ry != 0 || s != cardHoverScale || sx != 0 || sy != 0 {
-		t.Fatalf("center must be flat: rotX=%v rotY=%v scale=%v shift=(%v,%v)", rx, ry, s, sx, sy)
+	// 中心：没有角度也没有视差（放大由 hover_layout.go 负责，不在这里）。
+	if rx, ry, sx, sy := cardTiltTarget(w/2, h/2, w, h, true, false); rx != 0 || ry != 0 || sx != 0 || sy != 0 {
+		t.Fatalf("center must be flat: rotX=%v rotY=%v shift=(%v,%v)", rx, ry, sx, sy)
 	}
 
 	// 钳制：盒外远处与盒角给出同一个极限值。
-	cornerRX, cornerRY, _, cornerSX, cornerSY := cardTiltTarget(w, h, w, h, true, false)
-	farRX, farRY, _, farSX, farSY := cardTiltTarget(10*w, 10*h, w, h, true, false)
+	cornerRX, cornerRY, cornerSX, cornerSY := cardTiltTarget(w, h, w, h, true, false)
+	farRX, farRY, farSX, farSY := cardTiltTarget(10*w, 10*h, w, h, true, false)
 	if cornerRX != farRX || cornerRY != farRY || cornerSX != farSX || cornerSY != farSY {
 		t.Fatalf("out-of-box pointer must clamp: corner=(%v,%v,%v,%v) far=(%v,%v,%v,%v)",
 			cornerRX, cornerRY, cornerSX, cornerSY, farRX, farRY, farSX, farSY)
@@ -91,35 +87,40 @@ func tiltApp() *selectorApp {
 	}}
 }
 
-// TestCardTiltKeepsShellGeometryAndKeyboardChoice 是本次改动的验收条件：
-// 倾斜动画进行中，(1) 外壳几何（命中区域）不变，(2) 静止指针不得改写键盘
-// 选择。后者同时覆盖"入场面板缩放期间局部坐标漂移"这一回归——坐标取自
-// 根元素后必须稳定。
-func TestCardTiltKeepsShellGeometryAndKeyboardChoice(t *testing.T) {
+// TestCardHoverKeepsKeyboardChoiceAndRestoresGeometry 是交互层改动的验收条件：
+// 悬停动画进行中，(1) 悬停卡相对静止尺寸真的变大、邻居让开且互不重叠，
+// (2) 静止指针不得改写键盘选择，(3) 指针离开后所有卡片回到静止几何。
+//
+// 后者同时覆盖"入场面板缩放期间局部坐标漂移"这一回归——坐标取自根元素后
+// 必须稳定。
+func TestCardHoverKeepsKeyboardChoiceAndRestoresGeometry(t *testing.T) {
 	app := tiltApp()
 	view := ui.NewTester(app.view, 660, 490)
 
-	// 基准：指针不在窗口里时第一张卡的几何。
-	before, ok := view.Find("Personal")
-	if !ok {
-		t.Fatal("first profile is not visible")
+	// 基准：指针不在窗口里时三张卡的几何。
+	var before []ui.Rect
+	for _, p := range app.profiles {
+		before = append(before, mustFindRect(t, view, p.Name))
 	}
 
-	// 悬停到卡片左上角，让倾斜真实发生，然后跑完动画。
-	view.Move(before.X+2, before.Y+2)
+	// 悬停到第一张卡左上角：放大与倾斜一起发生，然后跑完弹簧。
+	view.Move(before[0].X+2, before[0].Y+2)
 	view.Advance(time.Second)
-	if !view.FramePending() {
-		// 没有待渲染帧说明弹簧已静止；这是允许的，但倾斜通道必须已经建立。
-		t.Log("tilt spring already settled")
-	}
 	view.Advance(time.Second)
 
 	during, ok := view.Find("Personal")
 	if !ok {
 		t.Fatal("hovered profile disappeared")
 	}
-	if !nearlySameRect(before, during) {
-		t.Fatalf("tilt moved the card's shell: before=%+v during=%+v", before, during)
+	if during.W <= before[0].W || during.H <= before[0].H {
+		t.Fatalf("the hovered card must grow past its rest size: rest=%+v hovered=%+v", before[0], during)
+	}
+	neighbor := mustFindRect(t, view, "Work")
+	if neighbor.H >= before[1].H {
+		t.Fatalf("the neighbour must give way: rest=%+v hovered=%+v", before[1], neighbor)
+	}
+	if during.Y+during.H > neighbor.Y+0.5 {
+		t.Fatalf("the hovered card overlaps its neighbour: hovered=%+v neighbour=%+v", during, neighbor)
 	}
 
 	// 倾斜进行中按方向键：静止指针不得把选择改回来。
@@ -140,12 +141,14 @@ func TestCardTiltKeepsShellGeometryAndKeyboardChoice(t *testing.T) {
 	view.Move(2, 2)
 	view.Advance(time.Second)
 	view.Advance(time.Second)
-	after, ok := view.Find("Personal")
-	if !ok {
-		t.Fatal("profile disappeared after the pointer left")
-	}
-	if !nearlySameRect(before, after) {
-		t.Fatalf("returning from tilt moved the card's shell: before=%+v after=%+v", before, after)
+	for i, p := range app.profiles {
+		after, ok := view.Find(p.Name)
+		if !ok {
+			t.Fatalf("profile %q disappeared after the pointer left", p.Name)
+		}
+		if !nearlySameRect(before[i], after) {
+			t.Fatalf("leaving the card did not restore %q: before=%+v after=%+v", p.Name, before[i], after)
+		}
 	}
 	if app.chosen != 1 {
 		t.Fatalf("leaving the card changed the choice: got %d, want 1", app.chosen)
@@ -153,10 +156,9 @@ func TestCardTiltKeepsShellGeometryAndKeyboardChoice(t *testing.T) {
 }
 
 // TestCardTiltEntryAnimationKeepsKeyboardChoice 是"入场缩放期间静止指针不得
-// 改写键盘选择"的回归：列表容器随面板缩放，它的局部坐标逐帧漂移；若把那份
-// 坐标当成"指针移动"的依据，静止的指针会把刚用方向键做出的选择改回去。
-// 这里选一个在入场动画中会跨越行边界的窗口坐标（(350,200) 在旧实现里会把
-// 选择从 1 改成 4）。
+// 改写键盘选择"的回归：面板进出场会缩放整个列表，卡片的窗口矩形逐帧变化；
+// 若把那份变化当成"指针移动"，静止的指针就会把刚用方向键做出的选择改回去。
+// 指针坐标取自根元素（窗口坐标），因此入场动画不会伪造移动。
 func TestCardTiltEntryAnimationKeepsKeyboardChoice(t *testing.T) {
 	app := &selectorApp{themeMode: ThemeLight}
 	for i := range 9 {
@@ -169,14 +171,19 @@ func TestCardTiltEntryAnimationKeepsKeyboardChoice(t *testing.T) {
 	view := ui.NewTester(app.view, 700, 470)
 	view.Move(350, 200)
 	view.Advance(6 * time.Millisecond)
+
+	// 指针落下的那一帧会把选择同步到指针下的行（这是真实移动，符合设计）；
+	// 之后的按键必须在自己的那一帧前进一格，并在整段入场动画里保持不变。
+	before := app.chosen
 	view.Key(0, ui.KeyRight)
-	if app.chosen != 1 {
-		t.Fatalf("the key press must apply in its own frame: got %d, want 1", app.chosen)
+	want := app.chosen
+	if want != before+1 {
+		t.Fatalf("the key press must apply in its own frame: got %d, want %d", want, before+1)
 	}
 	for range 12 {
 		view.Advance(6 * time.Millisecond)
-		if app.chosen != 1 {
-			t.Fatalf("the entry animation's drifting list coordinates overwrote the keyboard choice: got %d, want 1", app.chosen)
+		if app.chosen != want {
+			t.Fatalf("the entry animation's moving card rectangles overwrote the keyboard choice: got %d, want %d", app.chosen, want)
 		}
 	}
 }
@@ -216,8 +223,12 @@ func TestCardTiltRendersReal3D(t *testing.T) {
 	if tl.H <= rest.H || br.H <= rest.H {
 		t.Fatalf("perspective must change the tilted content's height: rest=%v topLeft=%v bottomRight=%v", rest, tl, br)
 	}
-	if !nearlySameRect(shell, mustFindRect(t, view, "Personal")) {
-		t.Fatalf("the shell must not move while the inner content tilts")
+	// 指针不动时，倾斜本身不得让交互层漂移：弹簧静止后连续两帧的盒子一致。
+	steady := mustFindRect(t, view, "Personal")
+	view.Advance(50 * time.Millisecond)
+	if !nearlySameRect(steady, mustFindRect(t, view, "Personal")) {
+		t.Fatalf("tilt keeps drifting the interaction layer while the pointer is still: %+v → %+v",
+			steady, mustFindRect(t, view, "Personal"))
 	}
 
 	// ReduceMotion：内层内容一像素都不动。
@@ -240,8 +251,9 @@ func TestCardTiltRendersReal3D(t *testing.T) {
 	}
 }
 
-// TestCardTiltGridKeepsOrderAndColumns 约束倾斜不改变身份顺序、列数与窗口尺寸：
-// 九身份网格下扫过卡片四角后，顺序、文本与窗口尺寸都不变。
+// TestCardTiltGridKeepsOrderAndColumns 约束悬停/倾斜不改变身份顺序、列数与
+// 窗口尺寸：九身份网格下扫过卡片四角后，身份顺序、同一行的相对次序与窗口
+// 尺寸都不变（卡片会因悬停而重新分配宽度，但顺序与列数不变）。
 func TestCardTiltGridKeepsOrderAndColumns(t *testing.T) {
 	app := &selectorApp{themeMode: ThemeLight}
 	for i := range 9 {
@@ -273,13 +285,27 @@ func TestCardTiltGridKeepsOrderAndColumns(t *testing.T) {
 		view.Advance(400 * time.Millisecond)
 	}
 
+	// 顺序与列数不变：每一行内卡片仍然从左到右排列，行内互不重叠。
 	for i, p := range app.profiles {
 		box, ok := view.Find(p.Name)
 		if !ok {
 			t.Fatalf("profile %q disappeared while tilting", p.Name)
 		}
-		if !nearlySameRect(baseline[i], box) {
-			t.Fatalf("tilt moved profile %q: before=%+v after=%+v", p.Name, baseline[i], box)
+		if col := i % 3; col > 0 {
+			prev := mustFindRect(t, view, app.profiles[i-1].Name)
+			if box.X < prev.X {
+				t.Fatalf("hover reordered row %d: %q is now left of %q", i/3, p.Name, app.profiles[i-1].Name)
+			}
+			if box.X+0.5 < prev.X+prev.W {
+				t.Fatalf("cards in row %d overlap: %+v and %+v", i/3, prev, box)
+			}
+		}
+		// 交叉轴放大只吃行间距，卡片不得侵入相邻行。
+		if row := i / 3; row > 0 {
+			above := mustFindRect(t, view, app.profiles[(row-1)*3].Name)
+			if box.Y+0.5 < above.Y+above.H {
+				t.Fatalf("hovered card %q overlaps the row above: %+v and %+v", p.Name, above, box)
+			}
 		}
 	}
 	if w, h := view.Image().Rect.Dx(), view.Image().Rect.Dy(); w != 700 || h != 470 {
@@ -411,122 +437,6 @@ func TestCardContentStaysInsideItsSurface(t *testing.T) {
 				t.Fatalf("at %v: %s spills outside the card surface: content=%+v surface=%+v", pt, label, r, p.surf)
 			}
 		}
-	}
-}
-
-// TestCardTiltStrengthMatchesAcrossWidths 是缺陷 2 的回归：透视距离随卡片
-// 宽度成比例（cardPerspective），所以窄卡与宽卡得到同一相对形变。
-//
-// 形变量用 card_motion.go 里 cardPerspective 推导出的同一公式算：把卡片宽度
-// 归一化为 u ∈ [-1/2, 1/2]，绕 y 轴转 θ 后的横向投影为
-//
-//	u' = u·cosθ / (1 + u·sinθ/k),  k = 透视距离 / 卡片宽度
-//
-// 这个量只取决于角度与 k。测试用同一指针相对位置（左上角内侧 3pt）得到同一
-// 角度，于是只剩 k 在起作用；两种真实卡片宽度（单列 622pt、网格 216.7pt）
-// 的相对形变差值必须 <15%。渲染侧另有 TestCardTiltRendersReal3D 与
-// TestCardContentStaysInsideItsSurface 证明该公式与绘制一致（拟合残差 <0.4px）。
-func TestCardTiltStrengthMatchesAcrossWidths(t *testing.T) {
-	if got := cardPerspective(0); got != cardTiltPerspective {
-		t.Fatalf("unknown width must fall back to the constant: got %v", got)
-	}
-	if a, b := cardPerspective(600), cardPerspective(200); absf(a/b-3) > 0.01 {
-		t.Fatalf("perspective must scale with width: 600→%v 200→%v", a, b)
-	}
-
-	// 相对形变：卡片左右边缘在投影后相对宽度的变化量。
-	deform := func(width float32) float64 {
-		// 左上角内侧 3pt 的同一相对位置，得到同一角度（角度不依赖宽度）。
-		px, py := float32(3), float32(3)
-		_, rotY, _, _, _ := cardTiltTarget(px, py, width, 56, true, false)
-		theta := float64(rotY) * math.Pi / 180
-		k := float64(cardPerspective(width) / width)
-		u := 0.5
-		outer := u * math.Cos(theta) / (1 + u*math.Sin(theta)/k)
-		return 2 * (u - outer) // 两侧边缘合计收窄比例
-	}
-
-	narrow := deform(622) // 单列卡实测外壳宽度
-	wide := deform(216.7) // 网格卡实测外壳宽度
-	ratio := absf(float32(narrow-wide)) / max(float32(narrow), float32(wide))
-	t.Logf("relative tilt deformation: 622pt card %.5f, 216.7pt card %.5f, difference %.1f%%", narrow, wide, ratio*100)
-	if ratio >= 0.15 {
-		t.Fatalf("tilt strength must not depend on card width: 622pt→%.5f vs 216.7pt→%.5f (%.1f%%)", narrow, wide, ratio*100)
-	}
-
-	// 旧行为（固定 700pt 透视）在同一公式下必然超出阈值，说明这条测试
-	// 确实约束了 cardPerspective，而不是恒真。
-	fixed := func(width float32) float64 {
-		_, rotY, _, _, _ := cardTiltTarget(3, 3, width, 56, true, false)
-		theta := float64(rotY) * math.Pi / 180
-		k := float64(cardTiltPerspective / width)
-		u := 0.5
-		outer := u * math.Cos(theta) / (1 + u*math.Sin(theta)/k)
-		return 2 * (u - outer)
-	}
-	oldRatio := absf(float32(fixed(622)-fixed(216.7))) / max(float32(fixed(622)), float32(fixed(216.7)))
-	t.Logf("same formula with a fixed 700pt perspective would differ by %.1f%%", oldRatio*100)
-	if oldRatio < 0.15 {
-		t.Fatalf("the fixed-perspective comparison must fail the threshold, else this test proves nothing: %.1f%%", oldRatio*100)
-	}
-}
-
-// TestCardTiltStrengthMeasuredAcrossWidths 用真实绘制佐证同一件事：在 4× 缩放
-// 下量卡片表面渲染高度的相对增量（1× 下这个量只有 1–5 像素，会被像素取整
-// 吞掉），单列卡与网格卡的相对形变差值必须 <15%。
-//
-// 注意分工：真正的回归守卫是上面的解析测试——像素取整会让这个实测指标在
-// 固定 700pt 透视下也只差 13.9%（勉强过线），而解析指标差 58.7%。实测测试
-// 只证明"绘制结果与推导一致、两种宽度落在同一量级"，不承担区分新旧实现的
-// 职责。
-func TestCardTiltStrengthMeasuredAcrossWidths(t *testing.T) {
-	relative := func(count, w, h int) (rel float64, cardW float32) {
-		app := &selectorApp{themeMode: ThemeLight}
-		for i := range count {
-			app.profiles = append(app.profiles, Profile{
-				Dir: fmt.Sprintf("Profile %d", i), Name: fmt.Sprintf("Identity %d", i+1),
-				Email: fmt.Sprintf("account%d@example.com", i+1), Color: ui.Hex("#3686E8"),
-			})
-		}
-		view := ui.NewTester(app.view, w, h)
-		view.SetScale(4)
-
-		// surfaceHeight 把指针放到 (px, py) 后，量卡片表面底色的渲染高度。
-		surfaceHeight := func(px, py float32) (float32, float32) {
-			view.Move(px, py)
-			view.Advance(time.Second)
-			view.Advance(time.Second)
-			shell := mustFindRect(t, view, "Identity 1")
-			img := view.Image()
-			fill := img.RGBAAt(int(shell.X+shell.W/2)*4, int(shell.Y)*4+12)
-			minY, maxY := 1<<30, -1
-			for y := max(int(shell.Y)*4-40, 0); y < min(int((shell.Y+shell.H)*4)+40, h*4); y++ {
-				for x := max(int(shell.X)*4-40, 0); x < min(int((shell.X+shell.W)*4)+40, w*4); x++ {
-					if sameColor(img.RGBAAt(x, y), fill) {
-						minY, maxY = min(minY, y), max(maxY, y)
-					}
-				}
-			}
-			if maxY < 0 {
-				t.Fatalf("no card surface painted")
-			}
-			return shell.W, float32(maxY-minY+1) / 4
-		}
-
-		cardW, restH := surfaceHeight(1, 1)
-		shell := mustFindRect(t, view, "Identity 1")
-		_, tiltH := surfaceHeight(shell.X+3, shell.Y+3)
-		return float64(absf(tiltH-restH)) / float64(cardW), cardW
-	}
-
-	narrow, narrowW := relative(3, 660, 420) // 单列卡
-	wide, wideW := relative(9, 700, 470)     // 网格卡
-	ratio := absf(float32(narrow-wide)) / max(float32(narrow), float32(wide))
-	t.Logf("measured relative deformation: %.1fpt card %.5f, %.1fpt card %.5f, difference %.1f%%",
-		narrowW, narrow, wideW, wide, ratio*100)
-	if ratio >= 0.15 {
-		t.Fatalf("measured tilt strength depends on card width: %.1fpt→%.5f vs %.1fpt→%.5f (%.1f%%)",
-			narrowW, narrow, wideW, wide, ratio*100)
 	}
 }
 
