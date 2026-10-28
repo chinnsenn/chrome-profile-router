@@ -1,18 +1,34 @@
-# Chrome Profile Router - macOS 临时浏览器身份选择菜单
-Go 1.27.3 + MyGo v0.6.4 + macOS 原生 Vibrancy
+# Chrome Profile Router - 选择 Chrome Profile 再打开链接的菜单
+Go 1.27.3 + MyGo v0.6.4；macOS 用原生 Vibrancy，Linux/Windows 走 MyGo 的实色/系统材质
 
 <directory>
+docs/ - 开发资料：视觉来源与出处说明、平台支持与验证记录、发布流程（见 docs/platforms.md 与 docs/releasing.md）
 resources/ - 应用图标源与打包资产
-.github/workflows/ - macOS 校验与双架构打包
+packaging/ - 跨平台打包与安装：package.sh 统一走 mygo；Linux 复用官方产物并把构建目录里的 install.sh 补进 tar.gz；Windows 只分发 exe + install.cmd + uninstall.cmd 的 zip（见 packaging/AGENTS.md）
+.github/workflows/ - 版本闸门、三平台原生校验与打包、`v*` 标签发布（见 .github/workflows/AGENTS.md）
 </directory>
 
 成员清单
-main.go: Profile 发现、请求队列、Chrome 启动与应用生命周期；按屏幕工作区调整窗口，成功启动后才将对应请求 ID 出队；在创建窗口前读入设置文件，用其中的材质档位与主题初始化外观。
+main.go: 请求队列、单实例入口与应用生命周期；按屏幕工作区调整窗口，成功启动后才将对应请求 ID 出队；在创建窗口前读入设置文件，用其中的材质档位与主题初始化外观；单实例锁只在 Linux/Windows 启用（macOS 由 LaunchServices 保证），后实例只把面板拉回前台，命令行由 MyGo 转发到 OnOpenURL/OnOpenFile。
+chrome.go: Profile 发现的解析层——读取 Chrome 的 `Local State`，按 `info_cache` 解出名称/邮箱/头像，跳过磁盘上已不存在的目录，`Default` 排在最前；如实区分文件缺失、JSON 损坏与无有效条目，绝不虚构占位身份；平台根目录由 chrome_<goos>.go 提供。
+chrome_darwin.go: macOS 的 Chrome 用户数据根目录（`~/Library/Application Support/Google/Chrome`），逐字保持已发布行为。
+chrome_linux.go: Linux 的根目录与可执行文件事实：`$XDG_CONFIG_HOME/google-chrome`（为空或相对则 `~/.config/google-chrome`）、PATH 上的 `google-chrome` → `google-chrome-stable`；不解析 Chromium/Flatpak/Snap。
+chrome_windows.go: Windows 的根目录与可执行文件事实：`%LOCALAPPDATA%\Google\Chrome\User Data`（取不到即报错，不回退 USERPROFILE）、`chrome.exe` 按 LOCALAPPDATA → ProgramFiles → ProgramFiles(x86) 顺序查找，缺失时列出已查找路径；不读注册表。
+launch.go: 交付层——`openWith` 在后台启动 Chrome、成功才按请求 ID 出队、失败保留并可重试；`chromeArgs` 只产出两个独立参数（Profile 目录与目标 URL，中文/空格/查询串原样交给 exec 加引号）；`runDetached` 用 `launchGrace`(700ms) 观察窗给出「这次交付是否失败」，窗口内未退出只表示没有观察到失败，不证明页面已导航完成，也不等待浏览器生命周期。
+launch_darwin.go: macOS 的 launchChrome：`/usr/bin/open -n -b com.google.Chrome --args --profile-directory=… URL`，8s 超时，参数与文案保持原样。
+launch_linux.go: Linux 的 launchChrome：直启 PATH 上的 Chrome，`setsid` 进入独立会话（应用交付完退出时不带走浏览器），再交给 runDetached。
+launch_windows.go: Windows 的 launchChrome：直启 chrome.exe 再交给 runDetached；不加进程创建标志（父进程退出后浏览器是否存活尚未验证，见 docs/platforms.md）。
+destination.go: 整幅宽度的地址卡：域名主行、路径/启动中/失败原因次行、队列剩余徽标、复制按钮；复制走 `mygo.Clipboard` 的跨平台实现（不再调用 pbcopy），失败可回显；设置面板打开时快捷键不复制。
+settings_panel.go: 设置面板的控件与绑定（两个浓度滑块、四档材质、三个动效开关、两档减少动态效果、恢复默认）以及面板模式位与 Esc 分层所需的开关函数；替换身份列表区、高度固定，关闭时冲刷设置。
+shortcut_darwin.go: macOS 的快捷键文案（`⌘`+键）。
+shortcut_other.go: 非 macOS 的快捷键文案（`Ctrl+`+键）；绑定本身来自 ui.Cmd，文案只影响提示。
+fileurl_other.go: 非 Windows 的 file URL 组成：POSIX 路径没有 host，path 原样交给 url.URL 转义。
+fileurl_windows.go: Windows 的 file URL 组成：盘符路径补前导 `/` 得到 `file:///C:/…`，UNC 的 server 作为 host 得到 `file://server/share/…`，反斜线一次性换成 `/`，绝不让 `%5C` 或「C: 被当成 scheme」进入 URL。
 settings.go: `<PathUserData>/settings.json` 的读写层（版本号 + 外观分组 theme/material/backgroundTint/cardTint + 动效分组 motion.spin/hover/tilt/reduceMotion）；首次运行原子写入默认值文件，缺失/损坏/未知键/越界/更新版本各自按默认值、夹取或只读运行，不覆盖用户文件；写盘前先读回旧文件按层合并，保留用户手改的未知键（顶层、appearance 与 motion 内），已知字段以内存中夹取后的值为准；材质名只收 mygo 的 macOS 材质常量，未知回落 popover；动效分组整组缺失时回落全开 + system，未知 reduceMotion 回落 system（没有 off）；面板改动走内存写入 + 标脏，离散项与关闭面板/退出前冲刷，滑块拖动期间不逐帧写盘；不碰原生窗口。
 motion.go: 内容层的入场与可中断出场生命周期（180ms 淡入 / 120ms 出场、缩放与 Y 位移、仅内容层降透明度）；以动画通道 Settled 判定完成并经 Window.Update 投递后 Quit，新请求在同一把锁下取消自然出场，显式关闭不被取消。
 layout.go: 单列与三列画廊共享的列数、卡片高度、头像/徽标尺寸和窗口尺寸预算；固定控件高度推导窗口尺寸，不预留未显示状态的空白；另提供设置面板的固定高度预算 panelSettingsHeight 与 settingsPanelSize（宽度沿用列表预算、高度固定，不参与 panelChromeBase/panelChrome 的推导）。
 hover_layout.go: 悬停放大与邻居让位的纯几何（网格同排沿 x 放大到 1.06、单列沿 y 增高到 1.08，邻居按 1/(1+d) 距离权重缩窄并移位，带首尾外边界与卡片间距保持不变，交叉轴只吃列表内缩/行间距余量）；零逐帧分配、不读指针与应用状态，静止时返回单位变换。
-view.go: 整幅宽度的目标地址卡加身份画廊与用户输入，按钮与 ⌘C 复制完整 URL 并就地反馈，状态在地址卡次行内反馈；手动主题同步原生磨砂外观；header 右侧的设置图标（三条滑杆，13pt 自绘，不用齿轮以免被误读成太阳/亮度）与视图内 ⌘, 切换设置面板，面板替换身份列表区（地址卡保留）并提供两个浓度滑块、四档材质、三个动效开关、两档减少动态效果与恢复默认，Esc 分层与面板期间的键盘屏蔽也在这里。
+view.go: 身份画廊与用户输入，指针/键盘意图转成选择、启动与退出；手动主题同步原生磨砂外观；header 右侧的设置图标（三条滑杆，13pt 自绘，不用齿轮以免被误读成太阳/亮度）与视图内快捷键切换设置面板（文案按平台来自 shortcut_<goos>.go），Esc 分层与面板期间的键盘屏蔽也在这里；地址卡在 destination.go，面板控件在 settings_panel.go。
 profile_view.go: 单列与三列共用身份卡片（身份色细条、32pt 真实头像、名称/邮箱两行、数字键徽标），拆成不随悬停变化的布局槽位、承载放大/让位并接收指针的可交互层、以及只做倾斜的内层表面三层，槽位盒子不随悬停移动；三个动效开关在这里落到绘制上（关掉流彩只保留静态基础边框与柔光且不调 Keyframes，关掉悬停放大走与 ReduceMotion 相同的单位变换，关掉倾斜不旋转不视差）；槽位 PassThrough 退出命中登记，命中与悬停只由已变换的交互层决定，可见边缘与可点边缘一致；悬停归属由窗口坐标与上一帧几何（可见矩形→静止槽位）判定，动画不能自己切走悬停；提供无障碍描述、悬停 Tooltip 与空格详情浮层。
 card_motion.go: 身份卡悬停 3D 倾斜与内层视差（5.5° 上限、透视距离为卡宽 2.5 倍、内容 1.5pt / 徽标 2pt、可打断弹簧跟随、离开归中）；倾斜开关与减少动态效果都由调用方传入，关掉时走与 ReduceMotion 相同的归零通路，不另写几何；只输出旋转与视差变换，不含缩放——放大与让位统一由 hover_layout.go 分配给整个画廊，这里再叠缩放会双重放大；不写选择、不改布局。
 view_style.go: 原生磨砂上的地址卡与卡片薄层、细边界、卡片投影与轻量反馈，保持文字对比；高对比或降低透明度时改用不透明表面并去掉投影；根背景与地址卡的覆盖 alpha 由入参决定（缺省值来自 settings.go 的默认外观）、常态/选中卡的次行文字色都在这里定义。
@@ -22,14 +38,27 @@ card_motion_test.go: 倾斜方向与钳制、ReduceMotion 归零、槽位几何�
 hover_layout_test.go: 网格同排与单列整列两种带状、悬停卡放大到 1.06/1.08、邻居按距离权重缩窄、带首尾外边界与间距守恒、卡片互不重叠、边缘卡单侧锚定、交叉轴受间距/内缩约束、ReduceMotion 与未就绪布局返回单位变换。
 hover_ui_test.go: 放大后命中区域跟随可见卡（首列 grownRight−2 必须落在邻居静止槽位内仍归本卡）、点击放大边缘只启动该卡一次、静止指针不伪造 hover 切换、离开后几何复原、悬停不改变窗口尺寸/列数/身份顺序。
 motion_test.go: 出场等待、显式关闭优先级、重置入场、立即中断、新请求取消与 ReduceMotion 的行为回归。
-routing_test.go: 请求队列、失败重试与文件 URL 编码的行为边界。
+routing_test.go: 请求队列与失败重试的行为边界（文件 URL 编码已按平台拆到 fileurl_*_test.go）。
+fileurl_other_test.go: POSIX 的 file URL 组成——host 为空、路径逐段保真（空格/#/?/% 都只是路径字符）、不伪造查询串与片段。
+fileurl_windows_test.go: Windows 的 file URL 组成——`C:\…` 得到 `file:///C:/…`、`\\server\share\…` 得到 `file://server/share/…`，用 url.Parse 独立解码并断言无反斜线/无 %5C。
+chrome_test.go: `loadProfilesFrom` 的解析契约：缺文件/坏 JSON/空条目必须报错、目录已不存在的条目被跳过、`Default` 优先、名称回落到目录名（用 t.TempDir 造 Local State，不依赖本机 Chrome）。
+chrome_darwin_test.go: macOS 根目录仍是 `~/Library/Application Support/Google/Chrome`。
+chrome_linux_test.go: Linux 根目录的 XDG 优先级（含相对路径被忽略）与 PATH 上 Stable 命令的查找顺序、缺失时的可读错误。
+chrome_windows_test.go: Windows 根目录只在 LOCALAPPDATA 下解析、缺失即报错，`chrome.exe` 的 per-user 优先顺序与缺失时列出已查找路径。
+helper_test.go: 测试二进制作为假 Chrome 的 TestMain 分支（argv 落盘 / 非零退出 / 长驻等待释放文件）、newHelperCommand 与 waitFor（等状态而不是等固定时长）；进程边界断言不依赖本机 Chrome，长驻 helper 由 t.Cleanup 释放，不留后台进程。
+launch_test.go: `runDetached` 的三类结局（立即非零失败、干净早退、长驻时按观察窗返回）；队列的交付状态由平台测试文件经真实 `openWith` 覆盖。
+launch_linux_test.go: Linux 端到端——从 PATH 找到假 chrome，profile 目录与目标 URL（中文、空格、&、#、本地文件路径）原样到达子进程，缺 Chrome 时不启动；另经真实 `openWith` 覆盖「失败保留请求」「成功后出队且收起 loading」。
+launch_windows_test.go: Windows 端到端——从 LOCALAPPDATA 找到假 chrome.exe，同样的参数保真、URL 用 url.Parse 独立校验、缺 Chrome 报错，以及同样的 `openWith` 交付状态。
 settings_test.go: 设置文件的首次生成默认值、损坏回落不覆盖、越界夹取、未知键容错、`version:2` 不回写、未知材质回落 popover、主题往返、motion 缺键/部分缺键/未知 reduceMotion 的回落、motion 层未知键在写盘后仍保留、恢复默认立即落盘、浓度只写当前外观那一侧且量化到 0.02 的行为边界（只写临时目录）。
 build.sh: 根据本机架构构建，在目标卷暂存验签后替换应用，失败时恢复旧包。
-README.md: 用户操作、构建安装与验证说明。
+README.md: 面向新访客的简明说明：定位、支持情况、安装、使用与验证命令；细节与视觉参数不在 README 展开。
+docs/visual-design.md: 选中卡流彩与柔光的来源、固定 commit 链接与结构差异；视觉数值仍以源码常量为准。
+docs/platforms.md: 平台支持矩阵与验证记录：各平台的 Chrome 路径与启动方式、默认浏览器只注册为候选的边界、启动观察窗的语义，以及 Linux/Windows 已验证与未验证的清单。
 go.mod / go.sum: Go 工具链及固定依赖版本。
-mygo.json: Bundle 标识、URL scheme、文档类型和版本的唯一声明来源。
+mygo.json: Bundle 标识、URL scheme、文档类型、Linux 打包意图和版本的唯一声明来源（当前 `0.1.0`；发布标签是 `v` + 这个版本串，逐字一致，规则见 docs/releasing.md）。`linux.webview: false` 声明这是原生 UI（不加载网页），因此 `.deb` 只依赖 GTK3、安装脚本也不检查 WebKitGTK；删掉它会让 mygo 默认按 WebView 应用打包，凭空加上 libwebkit2gtk 依赖。
 
 约束
+- 版本只有 `mygo.json` 的 `version` 一处来源：不新增 `VERSION` 文件或 Go 常量，资产命名也不另立表。发布用 `v<SemVer>` 标签（只收 core + prerelease，拒绝 build metadata 与前导零），标签与 manifest 不一致或格式非法时，任何打包与发布都不得开始；普通分支与 PR 只校验、构建，不创建 Release。
 - `mygo.App.OnOpenURL` / `OnOpenFile` 统一入队；不再手动遍历启动参数，避免重复请求。
 - `openWith` 持锁时只调用 `targetLocked` / `currentLocked`；Chrome 启动在后台运行，结果经 Window.Update 回到主线程。
 - Esc 分层：设置面板打开时 Esc 只关闭面板并回到身份列表，面板已关时才退出应用；关闭按钮、⌘Q 与系统退出不受队列或动效拦截。除此之外 Esc 永远有效（启动中、错误、空状态下都能用），装饰性动效不能延迟键盘选择与链接交付。
@@ -51,8 +80,15 @@ mygo.json: Bundle 标识、URL scheme、文档类型和版本的唯一声明来�
 - 只有地址卡与详情浮层是始终带投影的表面，身份卡常态近透明；两处例外：悬停卡保留一层极浅投影（`Shadow(0,1,3,0,cardShadow)`），选中卡的两级柔光是描边的延伸而非体积投影。除此之外不得给身份卡加投影，也不得用投影改变布局尺寸。
 - URL 域名独占地址卡主行、路径独占次行；卡片上的 1–9 数字键徽标是身份标识，不另设快捷键说明文字；错误或启动状态替换次行，不能预留底部空白。
 - 图标修改同步 SVG 与 PNG，MyGo 自动生成 ICNS；不得在安装后另行修改已签名资源。
+- 平台差异只允许出现在 build-tag 文件里：路径与可执行文件在 chrome_<goos>.go，启动在 launch_<goos>.go，快捷键文案在 shortcut_<goos>.go；不得为跨平台另造公共接口、配置项或运行时开关。
+- 范围只有 Chrome Stable：darwin 用 LaunchServices 的 bundle id，linux 只认 PATH 上的 `google-chrome` / `google-chrome-stable`，windows 只认 LOCALAPPDATA / ProgramFiles / ProgramFiles(x86) 下的 `chrome.exe`。不解析 Chromium、Beta、Flatpak、Snap，也不读注册表或新增环境变量回退。
+- 默认浏览器只注册为候选：应用运行期不写任何注册表、不调用 `RegisterURLScheme`、不碰 `UserChoice` 与任何「设为默认」的 API。Windows 的候选键由安装脚本在安装时写入，Linux 靠 `.desktop` 的 `MimeType`/`%U`，安装脚本不得调用 `xdg-mime default`。
+- 启动握手：darwin 仍用 `/usr/bin/open` 加 8s 超时；linux/windows 直启 Chrome，用 `launchGrace` 观察窗判定——窗口内非零退出即失败并保留请求，窗口内 0 退出或窗口结束时仍在运行都只表示"没有观察到失败"，不证明页面已导航完成。绝不等待浏览器进程生命周期，绝不删除 `SingletonLock`、不加启动重试、不按错误码硬编码绕过。
+- 单实例锁只在非 darwin 启用（macOS 由 LaunchServices 保证）；后实例只把面板拉回前台，命令行由 MyGo 转发的 `OnOpenURL`/`OnOpenFile` 入队，不得再遍历一遍参数。
+- 复制走 `mygo.Clipboard`（`transfer.TextData`），不再调用 `pbcopy` 等平台命令；快捷键绑定来自 `ui.Cmd`，只有提示文案按平台区分。
+- Linux 无原生材质时由 `c.Vibrancy()` 的 `ShowsMaterial()` 自动落实色表面，不新增「假磨砂」或材质配置字段。
 
 验证
-`go test ./...`、`go test -race ./...`、`go vet ./...`、`bash -n build.sh`；打包使用 `go run github.com/egoist/mygo/cmd/mygo build -skip-dmg -platform darwin/arm64,darwin/amd64`。`./build.sh` 会替换 `/Applications` 中的应用，仅在需要本机安装时执行。
+`go test ./...`、`go test -race ./...`、`go vet ./...`、`bash -n build.sh`；交叉编译检查 `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...` 与 `GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build ./...`（平台测试文件同样要能编译：`GOOS=… go vet ./...`）。打包使用 `go run github.com/egoist/mygo/cmd/mygo build -skip-dmg -platform darwin/arm64,darwin/amd64`，跨平台产物由 packaging/ 的脚本按平台列表构建（必须走 mygo，裸 `go build` 缺 scheme 元数据）。发布相关的离线校验是 `bash -n packaging/release.sh && bash packaging/release_test.sh` 与 `bash packaging/release.sh tag-check v<版本>`（发布用 `gh` 只发生在 CI 的 `publish` job，本地不得对远端写）。`./build.sh` 会替换 `/Applications` 中的应用，仅在需要本机安装时执行。
 
 [PROTOCOL]: 变更时更新此头部，然后检查 AGENTS.md（成员清单、约束与验证三节必须与实际实现一致）

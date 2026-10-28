@@ -1,7 +1,7 @@
 {
   "name": "Chrome Profile Router",
   "identifier": "io.github.chinnsenn.chrome-profile-router",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "urlSchemes": ["http", "https"],
   "fileAssociations": [
     {
@@ -24,6 +24,9 @@
         }
       ]
     }
+  },
+  "linux": {
+    "webview": false
   },
   "out": "build"
 }

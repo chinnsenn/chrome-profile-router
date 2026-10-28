@@ -1,14 +1,47 @@
-name: macOS checks
+name: checks
 
 on:
   push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
 
 permissions:
   contents: read
 
+# 同一个 ref 只跑一个：PR 取消旧运行；tag 排队但不取消，避免打断正在上传的 Release。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  verify:
+  # 版本闸门：先解析 mygo.json 并校验标签，后面的打包与发布都依赖它。
+  # PR / main 只校验 manifest 本身；只有 push v<SemVer> 标签才会得到 publish=true。
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      tag: ${{ steps.metadata.outputs.tag }}
+      prerelease: ${{ steps.metadata.outputs.prerelease }}
+      publish: ${{ steps.metadata.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check release metadata
+        id: metadata
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          bash packaging/release_test.sh
+          if [ "$REF_TYPE" = "tag" ]; then
+            bash packaging/release.sh tag-check "$REF_NAME" >> "$GITHUB_OUTPUT"
+          else
+            bash packaging/release.sh tag-check "" >> "$GITHUB_OUTPUT"
+          fi
+
+  # macOS：原生校验；PR / main 用 -skip-dmg 快速打包，tag 才生成双架构 DMG。
+  macos:
+    needs: version
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,4 +55,153 @@ jobs:
           go test ./...
           bash -n build.sh
       - name: Package both Mac architectures
-        run: go run github.com/egoist/mygo/cmd/mygo build -skip-dmg -platform darwin/arm64,darwin/amd64
+        env:
+          PUBLISH: ${{ needs.version.outputs.publish }}
+        run: |
+          if [ "$PUBLISH" = "true" ]; then
+            # 发布：MyGo 默认 ad-hoc 签名（-），生成 "<name> <version> <arch>.dmg"；
+            # 没有 Developer ID，不公证，安装限制见 docs/releasing.md。
+            go run github.com/egoist/mygo/cmd/mygo build -platform darwin/arm64,darwin/amd64
+          else
+            go run github.com/egoist/mygo/cmd/mygo build -skip-dmg -platform darwin/arm64,darwin/amd64
+          fi
+      # 每平台先把要发布的文件复制成扁平 staging 再上传：upload-artifact 会保留
+      # 共同根 build/ 下的 darwin-arm64/ 这类子目录，而 publish 要的是扁平 8 个文件。
+      - name: Stage DMGs
+        if: needs.version.outputs.publish == 'true'
+        run: |
+          stage="$RUNNER_TEMP/release-assets"
+          rm -rf "$stage" && mkdir -p "$stage"
+          cp build/darwin-*/*.dmg "$stage/"
+          count="$(find "$stage" -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          [ "$count" = "2" ] || { echo "期望 2 个 DMG，实际 $count"; exit 1; }
+          empty="$(find "$stage" -maxdepth 1 -type f -size 0 -print -quit)"
+          [ -z "$empty" ] || { echo "0 字节文件不能发布: $empty"; exit 1; }
+      - name: Upload DMGs
+        if: needs.version.outputs.publish == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: ${{ runner.temp }}/release-assets
+          if-no-files-found: error
+
+  # Linux：原生测试与打包（.deb / .tar.gz / install.sh / .desktop）
+  linux:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Check Go code
+        run: |
+          go vet ./...
+          go test ./...
+          bash -n packaging/package.sh
+      - name: Package Linux
+        run: bash packaging/package.sh linux/amd64,linux/arm64
+      - name: Stage Linux packages
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          stage="$RUNNER_TEMP/release-assets"
+          rm -rf "$stage" && mkdir -p "$stage"
+          cp build/linux-*/*.deb build/linux-*/*.tar.gz "$stage/"
+          deb="$(find "$stage" -maxdepth 1 -name '*.deb' | wc -l | tr -d ' ')"
+          tar="$(find "$stage" -maxdepth 1 -name '*.tar.gz' | wc -l | tr -d ' ')"
+          [ "$deb" = "2" ] && [ "$tar" = "2" ] || { echo "期望 2 个 .deb 与 2 个 .tar.gz，实际 $deb / $tar"; exit 1; }
+          empty="$(find "$stage" -maxdepth 1 -type f -size 0 -print -quit)"
+          [ -z "$empty" ] || { echo "0 字节文件不能发布: $empty"; exit 1; }
+          for f in "$stage"/*.tar.gz; do
+            case "$(basename "$f")" in
+              *"$VERSION"*) ;;
+              *) echo "归档名不含版本 $VERSION: $f"; exit 1 ;;
+            esac
+          done
+      - name: Upload Linux packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: ${{ runner.temp }}/release-assets
+          if-no-files-found: error
+
+  # Windows：原生测试、打包，并在隔离的 CI 用户里实跑 install.cmd / uninstall.cmd
+  windows:
+    needs: version
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Check Go code
+        run: |
+          go vet ./...
+          go test ./...
+      - name: Package Windows
+        run: bash packaging/package.sh windows/amd64,windows/arm64
+      - name: Smoke install and uninstall
+        shell: pwsh
+        run: pwsh -NoProfile -File packaging/windows/smoke.ps1
+      - name: Stage Windows packages
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          stage="$RUNNER_TEMP/release-assets"
+          rm -rf "$stage" && mkdir -p "$stage"
+          cp build/windows-*/*.zip "$stage/"
+          count="$(find "$stage" -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          [ "$count" = "2" ] || { echo "期望 2 个 zip，实际 $count"; exit 1; }
+          empty="$(find "$stage" -maxdepth 1 -type f -size 0 -print -quit)"
+          [ -z "$empty" ] || { echo "0 字节文件不能发布: $empty"; exit 1; }
+          for f in "$stage"/*.zip; do
+            case "$(basename "$f")" in
+              *"$VERSION"*) ;;
+              *) echo "zip 名不含版本 $VERSION: $f"; exit 1 ;;
+            esac
+          done
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-package
+          path: ${{ runner.temp }}/release-assets
+          if-no-files-found: error
+
+  # 发布：只在 push 标签且三个平台都成功时运行。权限只在这里开到 contents: write。
+  # if 里重复检查 event_name/ref_type，不单凭 job output——脚本在 PR 上也能被改。
+  publish:
+    needs: [version, macos, linux, windows]
+    if: >-
+      github.event_name == 'push' &&
+      github.ref_type == 'tag' &&
+      needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Verify the eight release assets
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: bash packaging/release.sh assets dist "$VERSION"
+      - name: Write SHA256SUMS
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: bash packaging/release.sh sums dist "$VERSION"
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+          PRERELEASE: ${{ needs.version.outputs.prerelease }}
+        run: bash packaging/release.sh publish dist "$VERSION"

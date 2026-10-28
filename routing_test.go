@@ -1,12 +1,11 @@
-// [INPUT]: 依赖 selectorApp 请求队列、启动收尾与标准 URL 编码。
-// [OUTPUT]: 保护启动期间新请求、失败重试和本地路径的用户可见契约。
+// [INPUT]: 依赖 selectorApp 请求队列与启动收尾。
+// [OUTPUT]: 保护启动期间新请求与失败重试的用户可见契约；文件 URL 编码在 fileurl_<平台>_test.go。
 // [POS]: 根包的路由边界回归，不执行 Chrome 或原生退出。
 // [PROTOCOL]: 变更时更新此头部，然后检查 AGENTS.md
 package main
 
 import (
 	"errors"
-	"net/url"
 	"testing"
 )
 
@@ -40,17 +39,3 @@ func TestLaunchFailurePreservesRequestForRetry(t *testing.T) {
 	}
 }
 
-func TestFileTargetPreservesSpecialCharacters(t *testing.T) {
-	path := "/tmp/日本語 #report?100%.html"
-	target, err := fileTarget(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	parsed, err := url.Parse(target)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if parsed.Scheme != "file" || parsed.Path != path || parsed.RawQuery != "" || parsed.Fragment != "" {
-		t.Fatalf("file path changed meaning: %q -> %#v", path, parsed)
-	}
-}

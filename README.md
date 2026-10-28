@@ -1,166 +1,94 @@
 # Chrome Profile Router
 
-一个用 Go 编写的轻量 macOS 默认浏览器分流工具，用于在外部打开链接时选择使用哪个 Google Chrome 账号 Profile。
+用 Go 与 [MyGo](https://github.com/egoist/mygo) 写的链接分流小工具：从外部打开链接时，先选一个 Chrome Profile，再把链接交给它。macOS 是主线，Linux 与 Windows 共用同一套流程。
 
 <p align="center">
-  <img src="resources/screenshots/preview-dark.png" alt="Chrome Profile Router 原生深色界面" width="680" />
+  <img src="resources/screenshots/preview-dark.png" alt="深色外观：地址卡与身份画廊" width="680" />
   <br />
   <br />
-  <img src="resources/screenshots/preview-light.png" alt="Chrome Profile Router 原生浅色界面" width="680" />
+  <img src="resources/screenshots/preview-light.png" alt="浅色外观：地址卡与身份画廊" width="680" />
 </p>
 
----
+## 它做什么
 
-## 解决的问题
+在多个 Chrome Profile 之间切换时，从微信、飞书、Slack 或终端点开的链接容易落进不合适的账号，比如公司内网用私人身份打开，私人链接掉进工作账号。
 
-在日常工作中，本地 Chrome 通常会同时登录多个账号（如个人、公司主账号、海外账号、测试环境等）。
+设为默认浏览器后，链接先到这里：顶部是目标地址，下面列出本机已有的 Chrome Profile，选哪个就用哪个打开，处理完就退出。
 
-当你在微信、飞书、Slack、邮件客户端或终端里点击一个网页链接时，macOS 默认只能把链接交给系统默认浏览器打开；而 Chrome 默认只会将链接丢给**最后活跃的那个窗口**，经常导致：
-- 用私人账号点开了公司内网或权限系统，提示权限不足；
-- 用工作账号点开了私人社交或娱乐链接，账号环境混乱。
+- 身份列表直接读 Chrome 的本地配置，名称、邮箱和头像都是现成的，不用维护清单
+- 选完身份后调起对应 Profile 的 Chrome 窗口，队列空了才退出，不常驻后台
+- 启动失败不会丢链接，可以再选一次
+- 跟随系统外观与减少动态效果，也可以在设置里单独调
 
-该工具的作用是在链接到达 Chrome 之前作为中间层拦截，弹出一个轻量选择器，由用户决定使用哪个 Profile 进行访问。
+## 支持情况
 
----
+macOS 12 及以上是主线：原生磨砂材质，默认浏览器设置里选中即生效。
 
-## 实现方案
+Linux amd64 已实测：在隔离的 Debian 13 + X11 环境里用官方 Chrome 做过端到端验证（发现 Profile、选身份后进入正确 Profile、队列依次交付、失败可重试、同一时间只出一个面板）。还没在真实桌面长期使用，界面是实色表面（GTK 没有原生磨砂）。arm64 只构建过，没有实际运行记录。
 
-1. **注册为系统默认浏览器**：
-   在 App 的 `Info.plist` 中声明 `CFBundleURLTypes`（http/https）与 `CFBundleDocumentTypes`（public.html），使其符合 macOS 系统设置中「默认网页浏览器」的注册门槛。
-2. **动态读取本地 Profile 配置**：
-   启动时直接解析 Chrome 本地的 `~/Library/Application Support/Google/Chrome/Local State`，动态获取所有已创建 Profile 的真实名称、绑定邮箱及物理目录，并直接读取本地缓存的头像，无需手动配置清单。
-3. **命令行唤起与即用即走**：
-   用户选择对应身份后，工具通过系统命令行直接调起 Chrome 对应的 Profile 窗口打开目标链接，随后立即退出自身，不常驻后台占用系统资源：
-   ```bash
-   open -n -b com.google.Chrome --args --profile-directory="<ProfileDir>" "<TargetURL>"
-   ```
-4. **自适应快捷菜单**：
-   URL 是菜单的视觉重点：整幅宽度的地址卡占据顶部，域名以 24pt 粗体独占主行，路径独占次行；启动状态、失败原因和队列剩余条数都在这张卡内提示，不额外占据菜单高度。1–4 个身份使用单列卡片，5 个起使用最多三列的身份画廊；9 个身份在常规桌面上以 3×3 展示，窗口约 700×340，底部只保留 14pt 内边距。每张卡片由身份色细条、32pt 真实头像、名称与邮箱两行、右侧数字键徽标组成。窄屏自动减少列数，达到高度上限后在账号区内滚动。菜单不显示应用标题或快捷键说明；左上角关闭按钮、`Esc` 或 `⌘Q` 可随时退出，右上角的设置图标（滑杆，或 `⌘,`）打开设置面板。关闭按钮首次点击播放一段短出场动画后退出，动画期间再点一次立即退出；`Esc`、`⌘Q`、原生关闭与系统退出始终立即退出，不等待任何动效。最后一条链接成功交付给 Chrome 后菜单自行出场，期间若有新链接入队则取消这次出场并继续留在屏幕上；显式点击关闭不会被新请求取消，自然出场期间点关闭则升级为显式关闭。
-   数字键 `1`–`9` 直接打开，回车确认；网格方向键按实际行列移动，末行不足时停在有效身份上；单列保留上下选择、左右循环。选中项自动滚入视野，静止鼠标不会覆盖键盘选择。悬停可查看完整名称和邮箱，键盘用户按空格展开或收起身份详情浮层（含完整名称、邮箱与 Chrome 身份目录）。状态提示不改变窗口尺寸、列数或身份顺序；悬停放大与邻居让位同样不改变窗口尺寸、列数、身份顺序或画廊外边界。
-   地址卡右侧点击“复制”或按 `⌘C`，可将当前完整 URL（含查询参数和片段）复制到系统剪贴板；复制后显示“已复制”，不会打开 Chrome 或移除队列请求。
-   设置面板在同一个窗口内替换身份列表区（地址卡保留，它也是“阅读面浓度”的实时预览对象），窗口高度切到固定预算，关闭后回到原来的列表高度；列数、滚动位置、选中项与身份顺序都不变。面板打开期间数字键 `1`–`9`、回车与 `⌘C` 都不启动身份、不复制（避免误交付链接），新链接照常入队并在地址卡显示剩余条数；`Esc` 先关闭面板，面板已关时才退出应用。面板内的控件可用 Tab 进入、方向键调值，全部带无障碍标签与两位小数读数。
-5. **外观与反馈**：
-   支持系统、浅色、深色三种外观，手动切换会同步原生磨砂材质。窗口背景保留 `NSVisualEffectView`（Popover 材质、BehindWindow 混合、Active 状态）负责桌面模糊，其上只覆一层主题色薄层：模糊来自原生材质，覆盖只压住背景底噪，主要文字对比由地址卡承担。覆盖 alpha 不是 Apple 公开的材质参数——原生材质本身不提供可调的模糊半径，能调的只有材质种类与这层覆盖的浓度。深色覆 `#16181D` @ 0.30、浅色覆 `#F6F6F7` @ 0.34；地址卡是唯一“够实”的阅读面，但仍是半透明玻璃而非实心块：深色 `#1E2229` @ 0.62、浅色白 @ 0.66，让域名与路径压在桌面内容上仍然可读；空格详情浮层压在卡片之上，因此更实一档：深色 `#1E2229` @ 0.72、浅色白 @ 0.82。文字始终不透明：常态卡次行深色 `#D8DEE9`、浅色 `#434D5A`，更弱一档的提示文字深色 `#BCC4D0`、浅色 `#5A636F`；选中卡次行深色 `#CDD3DE`、浅色 `#374151`。高对比模式或系统降低透明度时改用不透明表面并去掉投影。
-   身份卡常态是几乎不可见的薄底；悬停提亮并加一层极浅投影；选中换成主题色薄底、实心数字徽标，并额外得到一圈 1pt 流彩描边与两层同色柔光（仅在有材质且未降低透明度时）。按压只把卡片缩放到 0.98，不改变任何布局盒与列数。选中反馈即时生效，没有淡入延迟，也不做脉冲。
-   入场与出场只作用于内容层：面板内容以 180ms 无回弹弹簧淡入（缩放 0.97→1，自下方 6pt 归位），出场用 120ms 弹簧回到缩放 0.98、下移 4pt 并淡出；原生窗口透明度与磨砂材质始终不变，文字对比度不随动效下降。出场以动画通道真正结束为准，不按时钟猜测，也不用固定等待。颜色过渡、按压弹簧与短促淡入都不阻塞操作，并跟随系统减少动态效果（设置面板里还可以显式选“强制开启”，但不能关掉系统已经开启的减少动态效果）；键盘选择与数字键立即生效，没有过渡。
-   悬停身份卡时卡片会真实放大，同排邻居缩窄让位：网格里悬停卡沿同一行横向放大到约 1.06 倍，单列里沿纵向增高到约 1.08 倍；交叉轴只在有真实余量时小幅外扩，受列表内缩与行间距约束，因此并非所有布局都均匀放大同样的比例。缺口由同排（单列则为整列）的邻居分担，近邻让得多、远邻让得少；带首尾的外边界与卡片之间的间距保持不变，所以悬停不会推动整个画廊，也不会改变列数、身份顺序或窗口尺寸。鼠标离开后所有卡片平滑回到静止尺寸。卡片分三层：不随悬停变化的布局槽位、承载放大与让位并接收指针的可交互层、以及做 3D 倾斜的内层表面；放大后的可交互区域跟随放大后的可见卡，指针落在放大出来的边缘上仍算悬停。
-   倾斜只作用于内层表面，且只做旋转与视差、不再叠一层缩放（放大完全由上一条的让位几何负责）：最大 5.5°，透视距离取卡片宽度的 2.5 倍；卡片内的头像与文字列反向视差 1.5pt，数字键徽标 2pt，指针朝卡片哪一侧靠近，那一侧边缘就靠近观察者。跟随用可打断的弹簧（stiffness 260 / damping 30），指针离开后平滑归中。内容与表面一起转，文字、头像与徽标始终落在边框之内。系统开启减少动态效果、或设置面板里选了“强制开启”时，放大、让位、倾斜、视差、流彩角度与入场位移全部归零，界面保持静止几何，退出即时完成。设置面板里还能单独关掉选中卡流彩、悬停放大与让位、3D 倾斜：关掉流彩只保留静态基础选中边框与柔光（不再请求动画帧），关掉悬停放大只保留提亮底色与投影（几何停在静止槽位），关掉倾斜则不旋转也不视差。
-   图标以蓝色分流路径与青绿色身份入口表示链接分流，`resources/icon.svg` 为源，`icon.png` 由 MyGo 自动转换为 ICNS。
+Windows 为实验支持：已有 amd64/arm64 安装包，amd64 在 Wine 通过功能测试；原生 Windows 的默认应用、单实例和显示效果尚未验证。Wine 中还观察到中文渲染与第二实例转发问题，见[平台说明](docs/platforms.md)。
 
-### 选中卡流彩与柔光的来源
+需要本机已装 Chrome Stable 并至少创建过一个 Profile。构建需要 Go 1.27.3 及以上。
 
-参数取自三个 MIT 项目，`card_glow.go` 的常量与下表一一对应。
+## 安装
 
-| 来源（固定 commit） | 照搬的原值 | 本项目适配值 |
-| --- | --- | --- |
-| Stripe [`ba6f5ed`](https://github.com/stripe/stripe-ios/blob/ba6f5ed8b3011c3d8223fd9b6b0ee35d2e55e6af/StripeIdentity/StripeIdentity/Source/NativeComponents/Views/DocumentCapture/AnimatedBorderView.swift) `AnimatedBorderView` | stop 位置 `[0, 0.12, 0.55, 0.75, 1]`；亮弧 alpha 结构 `[c1, c2@0, c2@0, c1, c1]` | 透明 stop 与基础选中边框（accent α0.55）预合成，任何相位都不丢边框 |
-| Magic UI [`efe76fc`](https://github.com/magicuidesign/magicui/blob/efe76fc5755eca1142dd4f74c1d6f0ace2887e3c/apps/www/registry/magicui/border-beam.tsx) `BorderBeam` | 周期 `6s` 线性无限；线宽 `1`；暖色 `#FFAA40`、紫 `#9C40FF` | 只改渐变起始角，不旋转矩形；首尾 stop 取同一暖色，转圈接缝连续 |
-| Pow [`1b4b1dd`](https://github.com/EmergeTools/Pow/blob/1b4b1dda28c50b95f0872927ee2226fe8b58950e/Sources/Pow/Effects/GlowEffect.swift) `GlowEffect` | `amount=0.7`；alpha `sqrt(amount)/{1.2,4}`；半径 `amount*R/{4,2}`；偏移 `(0,0)` | 只取内两级，`R=19`、alpha 再乘 `0.62`：半径 3.325 / 6.650pt（sigma 1.6625 / 3.325），3.3333:1 的内外比例不变。`R` 与 `gain` 都是适配值，不是来源原值——依据是真机像素：选中卡底边外 2/3/4/5px 与未选中同像素相差浅色 27/20/13/9、深色 20/14/10/5 个 RGB 级，6pt 卡间距中线浅色 6 / 深色 4 级，邻卡自身像素 0–1 级。旧值 `R=8`/`0.45` 在同位置只有 2–5 级（深色 1–3 级），读不出辉光 |
-
-本项目只借用参数与结构，Go 实现为独立重写。两处结构差异：Stripe 与 BorderBeam 都用图层 + mask 只留 1px 环，这里直接用 `BorderConicGradient` 画环；Stripe 靠旋转整张渐变层推进（因此渐变层要做成覆盖对角线的正方形），这里只改渐变起始角，矩形不旋转，不需要那条技巧。主题 accent 不由渐变 stop 承担，而由基础选中边框与两级柔光体现。
-
-无障碍：系统开启减少动态效果时角度停止推进、停在 0°，静态描边与柔光照常保留，选中标识不消失；高对比、降低透明度或窗口无材质时才完全退回实色表面 + 清晰 1pt 描边，不出渐变、不出柔光。
-
----
-
-## 构建与使用
-
-### 环境要求
-
-- macOS 12.0+
-- [Go](https://go.dev/) 1.27.3+
-
-### 编译与安装
+macOS：
 
 ```bash
 git clone https://github.com/chinnsenn/chrome-profile-router.git
 cd chrome-profile-router
-
-# 一键编译并安装至 /Applications/Chrome Profile Router.app
 ./build.sh
 ```
 
-脚本自动选择 Apple Silicon 或 Intel 的本机架构，先在 `/Applications` 内暂存并校验新应用的签名，再替换现有版本；复制、验签或注册失败时保留或恢复旧版本。构建产物位于 `build/darwin-arm64/` 或 `build/darwin-amd64/`。
+`./build.sh` 按本机架构编译，先在目标卷暂存并校验签名，再替换 `/Applications/Chrome Profile Router.app`，替换失败时保留旧版本。
 
-仅构建、不安装：
+只打包、不安装：
 
 ```bash
 go run github.com/egoist/mygo/cmd/mygo build -skip-dmg -platform darwin/arm64,darwin/amd64
 ```
 
-本地校验使用 `go test ./...`、`go vet ./...` 和 `bash -n build.sh`；macOS CI 执行这些检查并打包两种架构。
+Linux 与 Windows 的安装步骤见 [docs/platforms.md](docs/platforms.md)：两者都只把自己登记成 http/https 的候选，默认浏览器仍由你在系统设置里选。
 
-### 设置
+打好的安装包在 [Releases](https://github.com/chinnsenn/chrome-profile-router/releases) 页下载。macOS 的 DMG 没有 Developer ID、未公证，首次打开可能要在「隐私与安全性」里手动允许；Windows 包仍是实验支持（原生 Windows 尚未验证）。
 
-设置入口就在菜单里：header 右侧的设置图标（三条滑杆），或按 `⌘,`（面板窗口不激活应用、没有菜单栏，所以标准 ⌘, 菜单命令收不到，快捷键由视图自己接管，与既有的 `⌘Q` 同一手法）。面板替换身份列表区，改动即时生效，关闭面板时写盘；不新建窗口、不加菜单栏常驻，也不改「选完即退」的进程模型。
+## 使用
 
-| 分组 | 设置项 | 控件 | 默认 |
-| --- | --- | --- | --- |
-| 外观 | 背景浓度 | 滑块 0.00–0.90，步长 0.02 | 深 0.30 / 浅 0.34 |
-| 外观 | 阅读面浓度（地址卡） | 滑块 0.30–0.95，步长 0.02 | 深 0.62 / 浅 0.66 |
-| 外观 | 磨砂材质 | 四档：`popover` / `hud` / `sidebar` / `under-window` | `popover` |
-| 动效 | 选中卡流彩 | 开关（关掉只保留静态基础选中边框与柔光，不再请求动画帧） | 开 |
-| 动效 | 悬停放大与让位 | 开关（关掉只提亮底色与投影，几何停在静止槽位） | 开 |
-| 动效 | 3D 倾斜 | 开关（关掉不倾斜、无视差） | 开 |
-| 动效 | 减少动态效果 | 两档：跟随系统 / 强制开启（没有“强制关闭”，不会覆盖系统设置） | 跟随系统 |
-| 操作 | 恢复默认 | 按钮（把外观与动效全部写回默认并立即生效、写盘） | — |
+先把 Chrome Profile Router 设为默认浏览器：macOS 在系统设置的「默认网页浏览器」里选，Linux/Windows 在各自的默认应用设置里选。之后从任何应用点开 http 或 https 链接，都会先出现选择菜单。
 
-两个浓度滑块编辑的是**当前外观那一侧**（深色或浅色），另一侧保持原值。面板内的控件都可用 Tab 进入、方向键调值，并带无障碍标签与两位小数读数。
+选好身份后，链接交给对应的 Chrome Profile 打开。队列里的链接都成功交付、没有剩余时，菜单自己关闭；启动失败会留在菜单上并说明原因，可以再选一次。
 
-系统开启「降低透明度」或「提高对比」时界面仍强制使用不透明表面，此时外观三项（两个浓度与材质）置灰只读，并在面板内说明原因；**不提供**“忽略系统设置”的开关。
+| 操作 | macOS | Linux / Windows |
+| --- | --- | --- |
+| 用指定身份打开链接 | 数字键 1 到 9，或方向键移动后回车 | 同左 |
+| 查看完整身份信息 | 空格 | 空格 |
+| 复制当前链接 | `⌘C` 或地址卡右侧的复制按钮 | `Ctrl+C` 或地址卡右侧的复制按钮 |
+| 打开设置 | `⌘,` 或右上角的设置图标 | `Ctrl+,` 或右上角的设置图标 |
+| 关闭 | `Esc`、左上角关闭按钮、`⌘Q` | `Esc`、左上角关闭按钮、`Ctrl+Q` |
 
-设置同时存成一份可手改的配置文件：
+设置面板在同一个窗口里替换身份列表，可以调背景与阅读面浓度、磨砂材质、几个卡片动效开关，以及减少动态效果。改动即时生效，关闭面板时写入配置文件。`Esc` 先关面板，面板关掉后再按才退出应用。
 
-```
-~/Library/Application Support/Chrome Profile Router/settings.json
-```
+想换回 Chrome、Safari 或其他浏览器时，回到同一处默认浏览器设置选回去就行。
 
-首次启动会写入一份默认值文件（默认值就是本版本原本的外观，删掉文件等价于回到默认）：
+## 开发
 
-```json
-{
-  "version": 1,
-  "appearance": {
-    "theme": "auto",
-    "material": "popover",
-    "backgroundTint": { "dark": 0.30, "light": 0.34 },
-    "cardTint": { "dark": 0.62, "light": 0.66 }
-  },
-  "motion": {
-    "spin": true,
-    "hover": true,
-    "tilt": true,
-    "reduceMotion": "system"
-  }
-}
+```bash
+go test ./...
+go test -race ./...
+go vet ./...
+bash -n build.sh
 ```
 
-| 键 | 取值 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `appearance.theme` | `auto` / `light` / `dark` | `auto` | 与界面右上角的分段控件同步，改动即写回 |
-| `appearance.material` | `window` / `content` / `sidebar` / `header` / `titlebar` / `under-window` / `under-page` / `menu` / `popover` / `hud` / `sheet` / `tooltip` / `selection` / `fullscreen-ui` | `popover` | 原生磨砂材质档位（面板只提供其中四档），写错或未知的名字回落到 `popover` |
-| `appearance.backgroundTint.dark` / `.light` | 0.00–0.90 | 0.30 / 0.34 | 根背景的覆盖不透明度（越界夹到边界） |
-| `appearance.cardTint.dark` / `.light` | 0.30–0.95 | 0.62 / 0.66 | 地址卡的覆盖不透明度（越界夹到边界） |
-| `motion.spin` | `true` / `false` | `true` | 选中卡流彩是否推进角度 |
-| `motion.hover` | `true` / `false` | `true` | 悬停放大与邻居让位是否生效 |
-| `motion.tilt` | `true` / `false` | `true` | 悬停 3D 倾斜与内层视差是否生效 |
-| `motion.reduceMotion` | `system` / `on` | `system` | `on` 等价于强制开启减少动态效果（与系统开启时行为一致）；没有 `off` |
+交叉编译检查（不需要本机装对应系统）：
 
-三件必须说清的事：
+```bash
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build ./...
+```
 
-1. `material` 是**材质档位**，不是模糊半径——`NSVisualEffectView` 只提供用途材质，没有可调的模糊半径，所以本项目也没有「模糊强度」这个数值。
-2. `backgroundTint` 是**覆盖不透明度**，不是模糊强度；调到 0.70 以上基本就把原生磨砂盖成实心板了。
-3. 面板里的改动即时生效并在关闭面板时写盘；**手改这个文件仍需重启应用**才生效，当前没有热重载。
+CI 在 macOS、Linux、Windows 上分别跑测试与 vet，并打包各平台产物；只有 push `v*` 标签才会创建 Release。版本号只有 `mygo.json` 一处，标签与发布的规则、资产清单见 [docs/releasing.md](docs/releasing.md)。
 
-容错：文件缺失会写入默认值；JSON 损坏、字段缺失或键名未知时按默认值继续运行，且不会重写你的文件；`version` 大于 1 时按默认外观运行且不回写。应用自己写盘时会先读回文件再按层合并，因此你在文件里额外加的键（含 `appearance` 与 `motion` 两层内部的键）不会丢。
-
-### 设为默认浏览器
-
-1. 打开 macOS **「系统设置」** → **「桌面与程序坞」**；
-2. 找到 **「默认网页浏览器」** 下拉菜单；
-3. 选择 **「Chrome Profile Router」**。
-
----
+选中卡流彩与柔光的参数出处见 [docs/visual-design.md](docs/visual-design.md)，平台差异与未验证项见 [docs/platforms.md](docs/platforms.md)。
 
 ## License
 

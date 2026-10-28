@@ -1,32 +1,23 @@
-// [INPUT]: 依赖 Chrome 的 Local State、MyGo 应用/窗口/屏幕/主题 API、settings.go 的外观设置、view.go 渲染、motion.go 内容生命周期，以及 layout.go 尺寸预算。
-// [OUTPUT]: 提供 Profile 发现、链接请求队列与 Chrome 启动，成功交付后推进自然出场，创建并布局窗口，同步降低透明度偏好，并在创建窗口前用设置文件里的材质档位与主题初始化外观。
-// [POS]: 根包的状态与路由层；界面在 view.go，内容进出场在 motion.go，配色与动效参数在 view_style.go，纯布局在 layout.go。
+// [INPUT]: 依赖 chrome.go 的 Profile 发现、launch.go 的交付、MyGo 应用/窗口/屏幕/主题 API、settings.go 的外观设置、view.go 渲染、motion.go 内容生命周期，以及 layout.go 尺寸预算。
+// [OUTPUT]: 提供链接请求队列与单实例入口，成功交付后推进自然出场，创建并布局窗口，同步降低透明度偏好，并在创建窗口前用设置文件里的材质档位与主题初始化外观。
+// [POS]: 根包的状态与路由层；界面在 view.go，Profile 发现在 chrome.go，Chrome 启动在 launch*.go，内容进出场在 motion.go，配色与动效参数在 view_style.go，纯布局在 layout.go。
 // [PROTOCOL]: 变更时更新此头部，然后检查 AGENTS.md
 package main
 
 import (
-	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/url"
-	"os"
-	"os/exec"
 	"path/filepath"
-	"sort"
+	"runtime"
 	"strings"
 	"sync"
-	"time"
 	"unicode/utf8"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 )
-
-// launchTimeout 限制单次 Chrome 启动动作的最长等待时间，避免 open 卡死
-// 时把整个 UI 拖进永久 loading 状态。
-const launchTimeout = 8 * time.Second
 
 // HomeURL 在没有收到任何外部链接请求时的兜底目标。
 const HomeURL = "https://www.google.com"
@@ -37,17 +28,6 @@ type Profile struct {
 	Email  string
 	Avatar *ui.Bitmap
 	Color  ui.Color
-}
-
-type LocalState struct {
-	Profile struct {
-		InfoCache map[string]struct {
-			Name                string `json:"name"`
-			GaiaName            string `json:"gaia_name"`
-			UserName            string `json:"user_name"`
-			GaiaPictureFileName string `json:"gaia_picture_file_name"`
-		} `json:"info_cache"`
-	} `json:"profile"`
 }
 
 type ThemeMode int
@@ -164,137 +144,6 @@ var modernGradients = []ui.Color{
 	ui.Hex("#14B8A6"), // Teal
 }
 
-// ============================================================================
-// Chrome Profile 发现
-// ============================================================================
-
-// chromePaths 返回 Local State 与 Chrome 用户数据根目录。
-func chromePaths() (statePath string, chromeBase string, err error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", "", fmt.Errorf("无法定位用户主目录: %w", err)
-	}
-	chromeBase = filepath.Join(home, "Library/Application Support/Google/Chrome")
-	return filepath.Join(chromeBase, "Local State"), chromeBase, nil
-}
-
-// loadChromeProfiles 读取 Chrome 的 Local State 并解析出可用 Profile。
-//
-// 关键约定：绝不返回虚构的占位 Profile。调用方必须通过 error 区分
-//   - 文件不存在（Chrome 未安装 / 从未登录）
-//   - JSON 解析失败（文件损坏或结构变更）
-//   - 解析成功但没有任何有效 Profile（条目为空，或磁盘上目录已不存在）
-//
-// 这样 UI 才能如实展示空状态，而不是假装成功。
-func loadChromeProfiles() ([]Profile, error) {
-	statePath, chromeBase, err := chromePaths()
-	if err != nil {
-		return nil, err
-	}
-
-	data, err := os.ReadFile(statePath)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("未找到 Chrome 配置文件：%s", statePath)
-		}
-		return nil, fmt.Errorf("读取 Chrome 配置失败: %w", err)
-	}
-
-	var state LocalState
-	if err := json.Unmarshal(data, &state); err != nil {
-		return nil, fmt.Errorf("Chrome 配置文件格式无法解析: %w", err)
-	}
-
-	if len(state.Profile.InfoCache) == 0 {
-		return nil, errors.New("Chrome 配置中没有任何 Profile 条目")
-	}
-
-	list := make([]Profile, 0, len(state.Profile.InfoCache))
-	colorIdx := 0
-	// 固定遍历顺序，保证配色分配在不同次加载之间保持稳定。
-	for _, dir := range sortedDirs(state.Profile.InfoCache) {
-		info := state.Profile.InfoCache[dir]
-
-		dirPath := filepath.Join(chromeBase, dir)
-		if fi, err := os.Stat(dirPath); err != nil || !fi.IsDir() {
-			continue
-		}
-
-		name := strings.TrimSpace(info.Name)
-		if name == "" {
-			name = strings.TrimSpace(info.GaiaName)
-		}
-		if name == "" {
-			name = strings.TrimSpace(info.UserName)
-		}
-		if name == "" {
-			name = dir
-		}
-
-		email := strings.TrimSpace(info.UserName)
-
-		var avatarBitmap *ui.Bitmap
-		picFileName := info.GaiaPictureFileName
-		if picFileName == "" {
-			picFileName = "Google Profile Picture.png"
-		}
-		avatarPath := filepath.Join(dirPath, picFileName)
-		if imgData, err := os.ReadFile(avatarPath); err == nil && len(imgData) > 0 {
-			if bm, err := ui.DecodeBitmap(imgData); err == nil {
-				avatarBitmap = bm
-			}
-		}
-
-		list = append(list, Profile{
-			Dir:    dir,
-			Name:   name,
-			Email:  email,
-			Avatar: avatarBitmap,
-			Color:  modernGradients[colorIdx%len(modernGradients)],
-		})
-		colorIdx++
-	}
-
-	if len(list) == 0 {
-		return nil, errors.New("检测到的 Profile 条目在磁盘上均不存在")
-	}
-
-	sort.Slice(list, func(i, j int) bool {
-		if list[i].Dir == "Default" {
-			return true
-		}
-		if list[j].Dir == "Default" {
-			return false
-		}
-		return strings.ToLower(list[i].Dir) < strings.ToLower(list[j].Dir)
-	})
-
-	return list, nil
-}
-
-// sortedDirs 让 InfoCache 的 map 遍历顺序变得确定。
-func sortedDirs(cache map[string]struct {
-	Name                string `json:"name"`
-	GaiaName            string `json:"gaia_name"`
-	UserName            string `json:"user_name"`
-	GaiaPictureFileName string `json:"gaia_picture_file_name"`
-}) []string {
-	dirs := make([]string, 0, len(cache))
-	for dir := range cache {
-		dirs = append(dirs, dir)
-	}
-	sort.Slice(dirs, func(i, j int) bool {
-		if dirs[i] == "Default" {
-			return true
-		}
-		if dirs[j] == "Default" {
-			return false
-		}
-		return strings.ToLower(dirs[i]) < strings.ToLower(dirs[j])
-	})
-	return dirs
-}
-
 // reload 重新扫描磁盘上的 Chrome Profile，并如实记录失败原因。
 //
 // 主线程调用。扫描与状态写入都在锁外/锁内明确分段：持锁时只改内存字段，
@@ -346,6 +195,12 @@ func (a *selectorApp) enqueue(r request) {
 	a.mu.Unlock()
 
 	// 新请求到达时清掉上一轮的失败提示，并把窗口拉回前台。
+	a.showPanel()
+}
+
+// showPanel 把面板拉回前台并重绘。可从任意 goroutine 调用：窗口调用由
+// MyGo 投递到主线程，界面状态不在这里改写。
+func (a *selectorApp) showPanel() {
 	if w := a.windowRef(); w != nil {
 		w.Update(func() {})
 		w.Show()
@@ -423,8 +278,11 @@ func fileTarget(path string) (string, error) {
 		return "", fmt.Errorf("无法解析绝对路径: %w", err)
 	}
 
-	// Path 字段让 url 包负责转义：空格 → %20，'#' → %23，'?' → %3F。
-	u := url.URL{Scheme: "file", Path: abs}
+	// 平台负责把绝对路径拆成 file URL 的 host 与 path：POSIX 没有 host，
+	// Windows 的盘符路径要补前导 "/"、UNC 的 server 是 host，且反斜线绝不
+	// 能进 URL。Path 字段让 url 包负责转义：空格 → %20，'#' → %23。
+	host, urlPath := fileURLParts(abs)
+	u := url.URL{Scheme: "file", Host: host, Path: urlPath}
 	return u.String(), nil
 }
 
@@ -482,113 +340,6 @@ func truncateRunes(s string, max int) string {
 		return string(r[:max])
 	}
 	return string(r[:max-3]) + "..."
-}
-
-// ============================================================================
-// Chrome 启动
-// ============================================================================
-
-// openWith 在后台 goroutine 中启动 Chrome，绝不阻塞 UI 线程。
-//
-// 成功且没有错误时：把本次消费的请求 ID 交给队列推进逻辑，由 Update 决定
-// 是打开下一条还是退出。失败时：记录 launchError 并让界面重绘，用户可原地
-// 重试。
-//
-// 锁纪律：整个函数在同一把 a.mu 下只能加锁一次。目标解析必须走
-// targetLocked()（非重入内核），绝不能调用会二次 Lock 的 target() / current()，
-// 否则 sync.Mutex 不可重入会导致 UI 主线程永久死锁。
-func (a *selectorApp) openWith(p Profile) {
-	a.mu.Lock()
-	if a.launching {
-		a.mu.Unlock()
-		return
-	}
-	target, err := a.targetLocked()
-	if err != nil {
-		a.launchError = err.Error()
-		a.mu.Unlock()
-		if w := a.windowRef(); w != nil {
-			w.Invalidate()
-		}
-		return
-	}
-
-	// 记录本次启动实际消费的请求 ID（0 表示并无队列请求，走 HomeURL）。
-	// 出队必须以 ID 为准，不能用"删队首"这种位置假设。
-	var launchedID uint64
-	if head, ok := a.currentLocked(); ok {
-		launchedID = head.ID
-	}
-
-	a.launching = true
-	a.launchError = ""
-	a.mu.Unlock()
-
-	w := a.windowRef()
-	if w != nil {
-		w.Invalidate()
-	}
-
-	go func() {
-		err := launchChrome(p.Dir, target)
-
-		if w == nil {
-			// 窗口尚未就绪（极早期触发），直接同步收尾。
-			if err != nil {
-				a.finishLaunch(err)
-				return
-			}
-			a.advanceQueue(launchedID)
-			return
-		}
-
-		// 所有状态写回都在 main thread 上完成，避免数据竞争。
-		w.Update(func() {
-			a.finishLaunch(err)
-			if err == nil {
-				a.advanceQueue(launchedID)
-			}
-		})
-	}()
-}
-
-// launchChrome 使用带超时的 Context 调用 /usr/bin/open 拉起 Chrome。
-func launchChrome(profileDir, target string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), launchTimeout)
-	defer cancel()
-
-	args := []string{
-		"-n",                      // 新实例，允许同一 Profile 多开窗口
-		"-b", "com.google.Chrome", // 按 bundle id 定位，避免中文环境下的名称匹配问题
-		"--args", // 之后的参数透传给 Chrome
-		"--profile-directory=" + profileDir,
-		target,
-	}
-
-	cmd := exec.CommandContext(ctx, "/usr/bin/open", args...)
-	out, err := cmd.CombinedOutput()
-
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return fmt.Errorf("启动 Chrome 超时（%s）", launchTimeout)
-	}
-	if err != nil {
-		msg := strings.TrimSpace(string(out))
-		if msg == "" {
-			return fmt.Errorf("启动 Chrome 失败: %w", err)
-		}
-		return fmt.Errorf("启动 Chrome 失败: %s", msg)
-	}
-	return nil
-}
-
-// finishLaunch 收起 loading 状态；err 非空时保留为界面可读的错误信息。
-func (a *selectorApp) finishLaunch(err error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.launching = false
-	if err != nil {
-		a.launchError = err.Error()
-	}
 }
 
 // advanceQueue 在成功打开一条请求后按 ID 出队；队列空则退出，否则继续处理。
@@ -744,6 +495,27 @@ func main() {
 		chosen:    0,
 		themeMode: ThemeAuto,
 	}
+
+	// 只对 Linux/Windows 加单实例锁：macOS 由 LaunchServices 保证同一份
+	// .app 只会有一个实例（再点一次是激活已有实例），再挂一层 socket 锁
+	// 会改变脚本重复启动的既有语义。
+	//
+	// 返回 false 表示命令行已经交给正在运行的实例，本进程直接退出。锁本身
+	// 建不起来时（例如临时目录只读）MyGo 按"只有这一个实例"处理并返回
+	// true，所以这里不需要额外的错误分支，更不能因为锁失败就退出。
+	if runtime.GOOS != "darwin" && !mygo.App.RequestSingleInstanceLock() {
+		return
+	}
+
+	// 后实例的命令行由 MyGo 自己转发：它先把 args 交给 OnSecondInstance，
+	// 再调用 deliverArgs 送到下面两个监听器。这里只把面板拉回前台，绝不
+	// 再遍历一遍 args，否则同一条链接会入队两次。
+	mygo.App.OnSecondInstance(func(args []string, workingDir string) {
+		a.mu.Lock()
+		a.cancelNaturalExitLocked()
+		a.mu.Unlock()
+		a.showPanel()
+	})
 
 	// 启动参数（URL / 文件路径）不在这里手动入队：MyGo 在 WhenReady 之后会
 	// 通过 launchArgs() → deliverArgs() 把 os.Args[1:] 中属于 urlSchemes 与
