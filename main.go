@@ -1,5 +1,5 @@
-// [INPUT]: 依赖 Chrome 的 Local State、MyGo 应用/窗口/屏幕/主题 API、view.go 渲染、motion.go 内容生命周期，以及 layout.go 尺寸预算。
-// [OUTPUT]: 提供 Profile 发现、链接请求队列与 Chrome 启动，成功交付后推进自然出场，创建并布局窗口，同步降低透明度偏好。
+// [INPUT]: 依赖 Chrome 的 Local State、MyGo 应用/窗口/屏幕/主题 API、settings.go 的外观设置、view.go 渲染、motion.go 内容生命周期，以及 layout.go 尺寸预算。
+// [OUTPUT]: 提供 Profile 发现、链接请求队列与 Chrome 启动，成功交付后推进自然出场，创建并布局窗口，同步降低透明度偏好，并在创建窗口前用设置文件里的材质档位与主题初始化外观。
 // [POS]: 根包的状态与路由层；界面在 view.go，内容进出场在 motion.go，配色与动效参数在 view_style.go，纯布局在 layout.go。
 // [PROTOCOL]: 变更时更新此头部，然后检查 AGENTS.md
 package main
@@ -93,11 +93,32 @@ type selectorApp struct {
 	window    *mygo.Window
 	themeMode ThemeMode
 
+	// settings 是 <PathUserData>/settings.json 的内容，在 NewWindow 之前
+	// 读入（Vibrancy 是构造参数，晚读会闪一帧默认材质）。settingsWritable
+	// 表示这份设置能写回：文件损坏或来自更新版本时为 false，避免我们把
+	// 用户手写的文件覆盖掉。界面只通过 snapshot 读取外观与动效值。
+	settings         settings
+	settingsWritable bool
+	// settingsDirty 表示内存里的设置还没落盘。滑块拖动期间每帧都在变，
+	// 逐帧原子写盘没有意义，所以只在离散项改动、面板关闭与退出前冲刷。
+	settingsDirty bool
+	// settingsDirOverride 只给测试注入临时目录用；生产路径永远是
+	// mygo.App.Path(PathUserData)，见 settingsDir。
+	settingsDirOverride string
+	// settingsOpen 是设置面板的模式位：它替换身份列表区、改变键盘路由
+	// （Esc 分层、数字键与回车不启动身份）与窗口高度，因此进 snapshot。
+	settingsOpen bool
+	// settingsUI 是设置面板控件的绑定值。滑块的指针必须跨帧稳定，所以它
+	// 不能指向 snapshot 的副本；只在主线程（渲染帧）读写。
+	settingsUI settingsUIState
+
 	// placed 与 layoutCount 记录窗口布局状态，只在主线程读写：placed 表示
 	// 已经完成首次定位（首次居中，之后保持用户拖到的位置），layoutCount 是
-	// 上次布局使用的身份数量。界面渲染从不读取它们，因此不进 snapshot。
-	placed      bool
-	layoutCount int
+	// 上次布局使用的身份数量，layoutSettings 是上次布局时设置面板是否打开
+	// （面板是固定高度，与身份数量无关）。界面渲染从不读取它们。
+	placed         bool
+	layoutCount    int
+	layoutSettings bool
 
 	// 启动状态：launching 防重入，launchError 用于界面回显失败原因。
 	launching   bool
@@ -616,14 +637,19 @@ func windowWorkArea(w *mygo.Window) mygo.Rectangle {
 	return mygo.Screen.DisplayMatching(w.Bounds()).WorkArea
 }
 
-// applyLayout 按身份数量与工作区写入窗口的内容区尺寸和位置，必须在主线程
-// 调用，且不能在渲染帧中途调用（见 requestLayout）。
+// applyLayout 按身份数量、设置面板模式与工作区写入窗口的内容区尺寸和位置，
+// 必须在主线程调用，且不能在渲染帧中途调用（见 requestLayout）。
 //
 // recenter 只在首次弹出时为真：那一次把面板居中在参考屏幕上；之后一律
 // 保留用户拖到的位置，仅把它夹回工作区内，避免重算尺寸时窗口无端跳回
 // 屏幕中央。
-func (a *selectorApp) applyLayout(w *mygo.Window, count int, workArea mygo.Rectangle, recenter bool) {
+func (a *selectorApp) applyLayout(w *mygo.Window, count int, settingsOpen bool, workArea mygo.Rectangle, recenter bool) {
 	width, height := profilePanelSize(count, workArea)
+	if settingsOpen {
+		// 设置面板是固定高度，不随身份数量变化；宽度沿用列表模式的预算，
+		// 因为关闭后必须回到同一宽度，不能让窗口横向跳动。
+		width, height = settingsPanelSize(count, workArea)
+	}
 
 	// 先记住当前左上角：改尺寸时系统可能把外框原点挪动（macOS 以左下角
 	// 为锚点），重排后必须按用户原来的位置写回，而不是接受漂移。
@@ -648,17 +674,19 @@ func (a *selectorApp) applyLayout(w *mygo.Window, count int, workArea mygo.Recta
 
 	a.placed = true
 	a.layoutCount = count
+	a.layoutSettings = settingsOpen
 }
 
-// requestLayout 安排一次窗口重排，身份数量没变时什么也不做。
+// requestLayout 安排一次窗口重排，身份数量与设置面板模式都没变时什么也不做。
 //
 // 真正的原生写入走 Window.Update，投递到下一轮主线程循环：reload 可能
 // 正在渲染帧内被"重新加载"按钮触发，此刻直接改窗口尺寸会让内容宿主在
 // 渲染途中收到 resize 回调。投递既避开重入，也不需要任何锁——闭包内的
 // 状态只在主线程读写。
 func (a *selectorApp) requestLayout(count int) {
+	settingsOpen := a.settingsOpenState()
 	// 还没排过版：启动路径会用 showWithLayout 在显示前一次性定位。
-	if !a.placed || a.layoutCount == count {
+	if !a.placed || a.layoutCount == count && a.layoutSettings == settingsOpen {
 		return
 	}
 	w := a.windowRef()
@@ -667,16 +695,16 @@ func (a *selectorApp) requestLayout(count int) {
 	}
 	w.Update(func() {
 		// 投递期间可能已经有别的路径排过版。
-		if !a.placed || a.layoutCount == count {
+		if !a.placed || a.layoutCount == count && a.layoutSettings == settingsOpen {
 			return
 		}
-		a.applyLayout(w, count, windowWorkArea(w), false)
+		a.applyLayout(w, count, settingsOpen, windowWorkArea(w), false)
 	})
 }
 
 // showWithLayout 在显示前完成尺寸与居中，并重置入场，隐藏帧不会消耗它。
 func (a *selectorApp) showWithLayout(w *mygo.Window) {
-	a.applyLayout(w, a.profileCount(), cursorWorkArea(), true)
+	a.applyLayout(w, a.profileCount(), a.settingsOpenState(), cursorWorkArea(), true)
 	a.resetEntry()
 	w.Show()
 	w.Invalidate()
@@ -704,7 +732,7 @@ func (a *selectorApp) handleDisplaysChanged() {
 // 与 requestLayout 的区别只在时机：它不做"身份数量没变就跳过"的判断，
 // 因为显示器本身变了，即使列数相同也要重新夹回新的工作区。
 func (a *selectorApp) relayout(w *mygo.Window) {
-	a.applyLayout(w, a.profileCount(), windowWorkArea(w), false)
+	a.applyLayout(w, a.profileCount(), a.settingsOpenState(), windowWorkArea(w), false)
 }
 
 // ============================================================================
@@ -731,6 +759,10 @@ func main() {
 
 	// 原生关闭、Esc、⌘Q 与系统退出不拦截；内容短出场由自身完成后退出。
 	mygo.App.WhenReady(func() {
+		// 设置必须在 NewWindow 之前读：Vibrancy 是构造参数，晚读会先闪一帧
+		// 默认材质再跳到用户档位。读取失败按默认值启动，不弹窗也不阻塞。
+		a.applySettings()
+
 		// 屏幕查询只在 WhenReady 之后可用，所以首次尺寸也在这里算：
 		// 先按空状态拿到一个保守的起始尺寸，避免窗口以默认 800×600 出现
 		// 在用户眼前；真实尺寸由 showWithLayout 在显示前写入。
@@ -754,14 +786,24 @@ func main() {
 			// Panel 让它像 Spotlight / Raycast 一样浮在当前 Space（含全屏
 			// 应用之上），不进入 Dock 与 App 切换器，并且在隐藏时把键盘
 			// 交还给用户原先所在的 App。这正是链接路由弹窗需要的语义。
-			Panel:    true,
-			Vibrancy: mygo.VibrancyPopover,
+			Panel: true,
+			// 磨砂材质来自设置文件（默认 popover）。它只决定材质档位，
+			// 不是模糊半径——NSVisualEffectView 没有半径可调。
+			Vibrancy: vibrancyForMaterial(a.settings.Appearance.Material),
 			Content:  ui.View(a.view),
 		})
 
 		a.mu.Lock()
 		a.window = w
 		a.mu.Unlock()
+
+		// 持久化的主题必须同时落到原生外观上，否则深色文字会落在浅色
+		// 材质上。主题切换的常规通路是 view.go 的 setThemeMode，这里只
+		// 补启动时的那一次。
+		if a.themeMode != ThemeAuto {
+			source := themeSource(a.themeMode)
+			w.Update(func() { mygo.Theme.SetSource(source) })
+		}
 
 		// 显示器增删或分辨率变化后，按窗口当前所在屏幕重新限制尺寸与
 		// 位置。回调可能来自任意线程，因此只做投递，真正的原生写入留在

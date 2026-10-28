@@ -29,6 +29,9 @@ func (a *selectorApp) profileListWith(c *ui.Context, pal palette, snap snapshot,
 	grid := total > singleColumnLimit
 	itemGap := panelItemGap(total)
 	itemHeight := panelItemHeight(total)
+	// 本帧生效的减少动态效果：系统偏好与设置里的「强制开启」取并集。
+	// 放大、让位、倾斜、视差与流彩角度都看这一个值。
+	reduce := snap.reduceMotion(c.Preferences().ReduceMotion)
 
 	cols := 1
 	if grid {
@@ -58,7 +61,7 @@ func (a *selectorApp) profileListWith(c *ui.Context, pal palette, snap snapshot,
 	slots, layers, pressed := gallery.elements(total)
 	items := func() {
 		for i, p := range snap.profiles {
-			slot, layer, down := a.profileItem(c, pal, snap, p, i, i == snap.chosen, !snap.launching, hovered == i, launch, itemHeight)
+			slot, layer, down := a.profileItem(c, pal, snap, p, i, i == snap.chosen, !snap.launching, hovered == i, launch, itemHeight, reduce)
 			slots[i], layers[i], pressed[i] = slot, layer, down
 			if i == snap.chosen {
 				chosenAnchor = slot
@@ -88,6 +91,11 @@ func (a *selectorApp) profileListWith(c *ui.Context, pal palette, snap snapshot,
 	// 静止盒子），结果写进本帧缓冲。悬停索引为 -1 时全部回到静止值，离开
 	// 因此是平滑复位而不是停在放大状态。
 	//
+	// 设置里关掉「悬停放大与让位」时，这里走与 ReduceMotion 完全相同的
+	// 归零通路（hoverLayout 的 reduceMotion 入参），不另写一套几何：悬停仍
+	// 提亮底色与投影，但槽位、命中盒与窗口尺寸都不动。变换通道照旧收敛到
+	// 单位变换，因此不会留下空转的动画帧。
+	//
 	// 变换只施加给**交互层**：它与可见表面严格重合，MyGo 的命中测试会逆变换
 	// 指针坐标，所以放大出来的边缘同样可点；slot 保持不动，滚动定位与详情
 	// 浮层锚点因此不受动画影响。
@@ -96,7 +104,7 @@ func (a *selectorApp) profileListWith(c *ui.Context, pal palette, snap snapshot,
 		rects[i] = slots[i].LayoutBounds()
 	}
 	shifts := gallery.shifts(total)
-	hoverLayout(shifts, rects, cols, itemGap, hovered, c.Preferences().ReduceMotion)
+	hoverLayout(shifts, rects, cols, itemGap, hovered, reduce || !snap.motion.Hover)
 	visible := gallery.visible(total)
 	for i := range layers {
 		press := float32(1)
@@ -219,7 +227,11 @@ func profileDetail(c *ui.Context, pal palette, prof Profile, idx int, anchor ui.
 //
 // 返回稳定 slot、交互层、是否被指针悬停、是否处于按下状态。按下与悬停的
 // 动画通道都由 profileList 统一施加（整条带要一起算空间分配）。
-func (a *selectorApp) profileItem(c *ui.Context, pal palette, snap snapshot, prof Profile, idx int, isChosen, canLaunch, hovered bool, launch func(Profile), height float32) (slot, layer ui.Element, pressed bool) {
+//
+// reduce 是本帧生效的减少动态效果（系统偏好与设置里的强制开启取并集）：
+// 它让倾斜归零、流彩角度不推进，但**不**退回实色——静态渐变与柔光照常
+// 保留，选中标识不消失。snap.motion 决定三个装饰性动效各自的开关。
+func (a *selectorApp) profileItem(c *ui.Context, pal palette, snap snapshot, prof Profile, idx int, isChosen, canLaunch, hovered bool, launch func(Profile), height float32, reduce bool) (slot, layer ui.Element, pressed bool) {
 	sub := profileSubtitle(prof)
 	fullTip := prof.Name
 	if sub != "" && sub != prof.Name {
@@ -283,7 +295,9 @@ func (a *selectorApp) profileItem(c *ui.Context, pal palette, snap snapshot, pro
 		}
 
 		// 倾斜作用于 surface；动画通道挂在 layer 上，跨帧保持同一个元素。
-		tilt, shiftX, shiftY := cardTilt(layer, c)
+		// 设置里关掉「3D 倾斜」时 cardTilt 走与 ReduceMotion 相同的归零
+		// 通路，不倾斜也不视差。
+		tilt, shiftX, shiftY := cardTilt(layer, snap.motion.Tilt, reduce)
 		// 徽标是最靠边缘的元素，视差略强一档，与 Atropos children 的深度差
 		// 一致；两个位移都取反，得到与倾斜方向相反的视差。
 		badgeShiftX, badgeShiftY := shiftX*cardParallaxBadgeRatio, shiftY*cardParallaxBadgeRatio
@@ -291,8 +305,16 @@ func (a *selectorApp) profileItem(c *ui.Context, pal palette, snap snapshot, pro
 		layer.Children(func() {
 			// 选中且非不透明回退时，描边换成预合成的锥形流彩：stops 已经
 			// 与基础选中边框合成过，所以这里不叠第二层，也不额外 DrawOver。
-			// 角度由 Keyframes 驱动；ReduceMotion 时停在 0°，静态边仍在。
-			spinning := isChosen && !pal.opaque
+			//
+			// 三条互不覆盖的条件：
+			//   - glow：选中且非不透明（ReduceMotion 与关掉流彩都不影响它，
+			//     选中标识不消失）；
+			//   - spinning：glow 成立且设置里「选中卡流彩」开着——关掉时只
+			//     保留静态基础选中边框，不再请求 Keyframes；
+			//   - 角度：强制减少动态效果时不推进（不调 chosenSpin，因此没有
+			//     空转的动画帧），停在 0° 与系统 ReduceMotion 的终态一致。
+			glow := isChosen && !pal.opaque
+			spinning := glow && snap.motion.Spin
 			surface := ui.Row(c).
 				Fill().
 				Padding(0, 8).
@@ -303,9 +325,13 @@ func (a *selectorApp) profileItem(c *ui.Context, pal palette, snap snapshot, pro
 				Border(chosenBorderWidth, rowBorder).
 				Transform(tilt)
 			if spinning {
-				surface.BorderConicGradient(chosenBorderGradient(layer, pal, chosenSpin(layer)))
+				var angle float32
+				if !reduce {
+					angle = chosenSpin(layer)
+				}
+				surface.BorderConicGradient(chosenBorderGradient(layer, pal, angle))
 			}
-			if spinning {
+			if glow {
 				// 选中比悬停再高一档：主题色薄底之外，Pow 的内两级单色辉光
 				// 把它从相邻卡片里托起来。阴影不参与布局，因此不会推动网格；
 				// 它替换选中原有的单层黑影，不叠加。

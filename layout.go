@@ -1,5 +1,5 @@
 // [INPUT]: 只依赖 mygo 的 Rectangle 类型与固定的面板几何常量。
-// [OUTPUT]: 提供共享布局常量（含头部/目标卡/间距、身份卡片与头像尺寸）、列数推导与窗口内容尺寸预算，供 view.go 与 main.go 共用。
+// [OUTPUT]: 提供共享布局常量（含头部/目标卡/间距、身份卡片与头像尺寸、设置面板固定高度）、列数推导与窗口内容尺寸预算（列表模式与设置面板模式），供 view.go 与 main.go 共用。
 // [POS]: 根包的布局层，纯计算；原生窗口的尺寸与位置写入在 main.go。
 // [PROTOCOL]: 变更时更新此头部，然后检查 AGENTS.md
 package main
@@ -79,6 +79,14 @@ const (
 	// 但要放得下说明、可选的失败原因与重新加载按钮（16pt 内边距 + 三行
 	// 文字 + 按钮，共约 140pt）。
 	panelEmptyHeight float32 = panelChromeBase + 150
+	// panelSettingsHeight 是设置面板（替换身份列表区）的内容高度：三组控件
+	// （外观 2 个滑块 + 1 个材质档位、动效 3 个开关 + 1 个减少动态效果档位、
+	// 操作 1 个恢复默认）加组标题与分组间距的固定预算。它不随身份数量变化，
+	// 因此打开/关闭设置只改窗口高度，不改列数、滚动位置或身份顺序。
+	//
+	// 它只是"列表区"的预算，不参与 panelChromeBase / panelChrome 的推导：
+	// 那两条仍只描述列表模式，既有窗口尺寸预算逐像素不变。
+	panelSettingsHeight float32 = 352
 	// panelMinWidth / panelMinHeight 是极端窄工作区下的下限：窗口不能因为
 	// 扣掉四周留白而变成零或负数尺寸，否则原生窗口会拒绝创建。
 	panelMinWidth  float32 = 260
@@ -149,6 +157,24 @@ func panelItemGap(count int) float32 {
 	return rowGap
 }
 
+// panelMaxHeight 是窗口内容高度的工作区上限：最多占工作区 80%，且四周留
+// panelScreenMargin，并保底 panelMinHeight（极窄工作区下窗口仍是非零尺寸）。
+func panelMaxHeight(areaH float32) float32 {
+	return max(panelMinHeight, min(areaH*panelWorkAreaFraction, areaH-float32(panelScreenMargin)))
+}
+
+// settingsPanelSize 返回设置面板打开时的窗口内容尺寸。
+//
+// 宽度沿用 profilePanelSize 的列表预算——关闭设置后窗口必须回到原宽度，
+// 横向跳动会让用户以为窗口被重置了。高度是固定预算：panelChromeBase 加上
+// panelSettingsHeight（面板内容），再受工作区上限约束；放不下时面板内部
+// 滚动，窗口本身绝不超出工作区。
+func settingsPanelSize(count int, workArea mygo.Rectangle) (width, height int) {
+	width, _ = profilePanelSize(count, workArea)
+	want := panelChromeBase + panelSettingsHeight
+	return width, int(min(want, panelMaxHeight(float32(workArea.Height))))
+}
+
 // profilePanelSize 返回面板内容区的尺寸预算。
 //
 // workArea 必须是 MyGo 报告的真实可用工作区（正宽高）；没有显示器就没有
@@ -172,7 +198,7 @@ func profilePanelSize(count int, workArea mygo.Rectangle) (width, height int) {
 	// 可用的、非零的尺寸，而不是被负值交给原生层。
 	width = int(max(panelMinWidth, min(preferred, areaW-float32(panelScreenMargin))))
 
-	maxHeight := max(panelMinHeight, min(areaH*panelWorkAreaFraction, areaH-float32(panelScreenMargin)))
+	maxHeight := panelMaxHeight(areaH)
 
 	want := panelEmptyHeight
 	if count > 0 {

@@ -1,5 +1,5 @@
-// [INPUT]: 依赖 selectorApp 队列/启动状态、MyGo ui 包、view_style.go 调色板、motion.go 内容生命周期，以及 layout.go 布局常量。
-// [OUTPUT]: 渲染整幅宽度的地址卡与身份画廊，支持按钮/⌘C 复制完整 URL，并把指针与键盘意图转成选择、启动与退出。
+// [INPUT]: 依赖 selectorApp 队列/启动状态、MyGo ui 包、view_style.go 调色板、settings.go 的外观设置、motion.go 内容生命周期，以及 layout.go 布局常量。
+// [OUTPUT]: 渲染整幅宽度的地址卡与身份画廊，支持按钮/⌘C 复制完整 URL，并把指针与键盘意图转成选择、启动与退出；header 右侧提供设置入口（自绘滑杆图标 + 视图内 ⌘,），设置面板替换身份列表区并可实时调整外观与动效；把设置文件里的覆盖不透明度、主题与动效开关喂给调色板与卡片，用户改动时写回设置文件。
 // [POS]: 根包的视图层主入口；身份项渲染委托给 profile_view.go，路由与队列逻辑仍在 main.go。
 // [PROTOCOL]: 变更时更新此头部，然后检查 AGENTS.md
 package main
@@ -27,29 +27,63 @@ type snapshot struct {
 	// reduceTransparency 是系统"降低透明度"偏好：与其它帧状态一起在持锁
 	// 时复制，渲染期间不再回读 selectorApp。
 	reduceTransparency bool
+	// appearance 是设置文件里的外观值（主题、材质档位、两层覆盖不透明度），
+	// 已夹取并补齐默认值；渲染帧只用它，不再回读文件。
+	appearance appearanceSettings
+	// motion 是设置文件里的动效分组（三个开关 + 减少动态效果档位），已补齐
+	// 默认值；渲染帧用它决定要不要跑流彩、放大让位与倾斜。
+	motion motionSettings
+	// settingsOpen 表示本帧画的是设置面板而不是身份列表。
+	settingsOpen bool
+}
+
+// reduceMotion 报告本帧是否按"减少动态效果"渲染：系统偏好与设置里的
+// 「强制开启」取并集。没有「强制关闭」——那会覆盖系统的 ReduceMotion。
+func (s snapshot) reduceMotion(system bool) bool {
+	return system || s.motion.ReduceMotion == motionReduceOn
 }
 
 // view 绘制整个窗口。它只读 selectorApp 的状态，所有副作用都在本帧内
-// 明确发生：键盘选择、悬停选择、主题切换与重新加载。
+// 明确发生：键盘选择、悬停选择、主题切换、设置面板与重新加载。
 func (a *selectorApp) view(c *ui.Context) {
+	a.viewWith(c, a.openWith)
+}
+
+// viewWith 是 view 的实现，启动动作由调用方给出。
+//
+// 生产路径永远传 a.openWith；测试传记录用的回调，于是"设置面板打开时数字键
+// 与回车会不会启动身份"可以在不拉起任何 Chrome 进程的前提下被断言（与
+// profileListWith 同一手法：没有全局可变的 launcher）。
+func (a *selectorApp) viewWith(c *ui.Context, launch func(Profile)) {
 	if a.reloadRequested {
 		a.reloadRequested = false
 		a.reload()
 	}
 
-	// Esc 永远有效：无论是否正在启动、是否有错误或空状态，都直接退出。
+	// Esc 分层：设置面板打开时只关闭面板（回到身份列表），面板已关时才退出
+	// 应用。除此之外 Esc 仍然永远有效——启动中、错误、空状态下都能用。
 	if c.Shortcut(0, ui.KeyEscape) {
+		if a.closeSettings() {
+			c.Invalidate()
+			return
+		}
 		a.requestQuit()
 		return
 	}
-	// 面板窗口不激活应用，系统菜单栏收不到 ⌘Q，所以在这里直接接管，
-	// 保持"⌘Q 立即退出"这一既有契约。
+	// 面板窗口不激活应用，系统菜单栏收不到 ⌘Q 与 ⌘,，所以两个快捷键都在
+	// 视图内直接接管（与既有的 ⌘Q 同一手法）。⌘, 切换设置面板，⌘Q 立即退出。
 	if c.Shortcut(ui.Cmd, ui.KeyQ) {
+		a.flushSettings()
 		a.requestQuit()
+		return
+	}
+	if c.Shortcut(ui.Cmd, ui.KeyComma) {
+		a.toggleSettings()
+		c.Invalidate()
 		return
 	}
 	// 键盘先于渲染处理：按键在送达的这一帧就改变选择，没有一帧延迟。
-	if a.handleKeys(c) {
+	if a.handleKeysWith(c, launch) {
 		return
 	}
 
@@ -57,41 +91,65 @@ func (a *selectorApp) view(c *ui.Context) {
 	if snap.chosen < 0 || snap.chosen >= len(snap.profiles) {
 		snap.chosen = 0
 	}
+	// 本帧生效的减少动态效果：系统偏好与「强制开启」取并集。
+	reduce := snap.reduceMotion(c.Preferences().ReduceMotion)
 
 	detailOpen := ui.Local(c.Root(), "profileDetailOpen", func() bool { return false })
-	if c.Shortcut(0, ui.KeySpace) && !snap.launching && len(snap.profiles) > 0 {
+	if c.Shortcut(0, ui.KeySpace) && !snap.launching && len(snap.profiles) > 0 && !snap.settingsOpen {
 		*detailOpen = !*detailOpen
 		c.Invalidate()
 	}
-	if snap.launching || len(snap.profiles) == 0 {
+	if snap.launching || len(snap.profiles) == 0 || snap.settingsOpen {
 		*detailOpen = false
 	}
 	dark := snap.themeMode == ThemeDark || (snap.themeMode == ThemeAuto && c.Theme().Dark)
 	// 原生磨砂由窗口提供；高对比与系统"降低透明度"都改用实色表面。
 	// c.Vibrancy 仅反映窗口材质配置，不等同于无障碍偏好；降低透明度由
 	// main.go 在应用启动后读取一次并随主题变化刷新，渲染帧不再访问
-	// mygo.Theme（那会在离屏测试里 panic）。减少动态效果由框架处理。
-	pal := newPalette(dark, c.Vibrancy(), c.Preferences().HighContrast, snap.reduceTransparency)
+	// mygo.Theme（那会在离屏测试里 panic）。减少动态效果由框架处理，
+	// 设置里的「强制开启」由 snapshot.reduceMotion 并进同一个判断。
+	// 两层覆盖不透明度取当前外观那一侧；无障碍降级优先于设置，opaque
+	// 分支不使用它们。
+	backgroundTint, cardTint := snap.appearance.BackgroundTint.Dark, snap.appearance.CardTint.Dark
+	if !dark {
+		backgroundTint, cardTint = snap.appearance.BackgroundTint.Light, snap.appearance.CardTint.Light
+	}
+	pal := newPaletteTinted(dark, c.Vibrancy(), c.Preferences().HighContrast, snap.reduceTransparency, backgroundTint, cardTint)
 
 	// 主题色半透明覆盖原生磨砂，手动主题也保持对比度；文字始终不透明。
 	c.Root().Background(pal.window)
 
 	// 原生磨砂与 Root 始终不变，进出场只作用于内容层。
 	panel := ui.Column(c).Fill().Padding(panelPadding).Gap(menuGap)
-	a.animatePanel(c, panel)
+	a.animateContent(c, panel, reduce)
 
 	panel.Children(func() {
-		a.header(c, pal, snap.themeMode)
+		a.header(c, pal, snap)
 		a.destination(c, pal, snap)
-		if len(snap.profiles) == 0 {
+		switch {
+		case snap.settingsOpen:
+			// 设置面板替换身份列表区；地址卡保留，用户仍看得到当前链接与
+			// 剩余条数，它同时是「阅读面浓度」的实时预览对象。
+			a.settingsPanel(c, pal, dark)
+		case len(snap.profiles) == 0:
 			emptyState(c, pal, snap.loadErr, func() {
 				a.reloadRequested = true
 				c.Invalidate()
 			})
-		} else {
-			a.profileList(c, pal, snap, detailOpen)
+		default:
+			a.profileListWith(c, pal, snap, detailOpen, launch)
 		}
 	})
+}
+
+// animateContent 在「减少动态效果」生效时把内容层钉在终态：入场不做缩放与
+// 位移，出场也不动。动画通道仍由 motion.go 推进并完成，因此退出通路与原生
+// 窗口的销毁时机完全不变——这里只覆盖本帧的变换与透明度，不改动生命周期。
+func (a *selectorApp) animateContent(c *ui.Context, panel ui.Element, reduce bool) {
+	a.animatePanel(c, panel)
+	if reduce {
+		panel.Transform(ui.Transform{}).Opacity(1)
+	}
 }
 
 // snapshot 在持锁状态下复制本帧需要的状态。
@@ -107,22 +165,44 @@ func (a *selectorApp) snapshot() snapshot {
 		loadErr:            a.loadErr,
 		revealChosen:       a.revealChosen,
 		reduceTransparency: a.reduceTransparency,
+		appearance:         a.settings.Appearance.normalized(),
+		motion:             a.settings.Motion.normalized(),
+		settingsOpen:       a.settingsOpen,
 	}
-	a.revealChosen = false
+	// revealChosen 是"下一帧把选中项滚进视野"的一次性标记，只有真正画列表
+	// 的帧才消费它：设置面板打开时列表没画，标记必须留着，否则关闭面板后
+	// 选中卡可能停在视口外。
+	if !a.settingsOpen {
+		a.revealChosen = false
+	}
 	return s
 }
 
 // handleKeys 处理本帧送达的按键，返回 true 表示已发起启动、本帧无需再渲染。
 func (a *selectorApp) handleKeys(c *ui.Context) bool {
+	return a.handleKeysWith(c, a.openWith)
+}
+
+// handleKeysWith 是 handleKeys 的实现，启动动作由调用方给出（测试注入记录
+// 回调，生产路径永远传 a.openWith）。
+func (a *selectorApp) handleKeysWith(c *ui.Context, launch func(Profile)) bool {
 	// 只读状态，绝不清 revealChosen——那是渲染帧要消费的一次性标记。
 	a.mu.Lock()
 	profiles := a.profiles // 整体替换而非原地修改，复制切片头即可安全读取
 	total := len(profiles)
 	launching := a.launching
 	chosen := a.chosen
+	settingsOpen := a.settingsOpen
 	a.mu.Unlock()
 
-	// 启动中屏蔽重复触发；Esc 与 ⌘Q 已在调用方处理，仍可随时退出。
+	// 设置面板打开时键盘只归面板：数字键、回车、⌘C 与方向键都不能启动身份
+	// 或改写列表选择（避免误交付链接，也保证关闭面板后选中项、滚动位置与
+	// 列表布局一律不变）。新链接仍照常入队，并在地址卡显示剩余条数。
+	if settingsOpen {
+		return false
+	}
+
+	// 启动中屏蔽重复触发；Esc、⌘Q 与 ⌘, 已在调用方处理，仍可随时退出。
 	if total == 0 || launching {
 		return false
 	}
@@ -131,7 +211,7 @@ func (a *selectorApp) handleKeys(c *ui.Context) bool {
 	}
 
 	if c.Shortcut(0, ui.KeyEnter) {
-		a.openWith(profiles[chosen])
+		launch(profiles[chosen])
 		return true
 	}
 
@@ -209,26 +289,37 @@ func (a *selectorApp) handleKeys(c *ui.Context) bool {
 	for idx, key := range digitKeys {
 		if idx < total && c.Shortcut(0, key) {
 			a.setChosen(idx)
-			a.openWith(profiles[idx])
+			launch(profiles[idx])
 			return true
 		}
 	}
 	return false
 }
 
-// header 是顶部一行：左侧关闭控件、右侧主题开关，没有标题也没有常驻说明。
-// 整行可拖动窗口，因为窗口隐藏了标题栏；高度固定，绝不因内容变化而增高。
-func (a *selectorApp) header(c *ui.Context, pal palette, mode ThemeMode) {
+// header 是顶部一行：左侧关闭控件、右侧设置入口与主题开关，没有标题也没有
+// 常驻说明。整行可拖动窗口，因为窗口隐藏了标题栏；高度固定，绝不因内容变化
+// 而增高——设置图标与关闭控件同为 menuHeaderHeight 见方，因此不撑高这一行。
+func (a *selectorApp) header(c *ui.Context, pal palette, snap snapshot) {
 	ui.Row(c).
 		Key("header").
 		Height(menuHeaderHeight).
 		AlignItems(ui.Center).
+		Gap(4).
 		DragWindow().
 		Shrink(0).
 		Children(func() {
-			closeControl(c, pal, func() { a.beginExit(exitClose) })
+			// 原生关闭：先把尚未落盘的设置冲刷掉，再走既有的短出场。
+			closeControl(c, pal, func() {
+				a.flushSettings()
+				a.beginExit(exitClose)
+			})
 
 			ui.Spacer(c)
+
+			settingsControl(c, pal, snap.settingsOpen, func() {
+				a.toggleSettings()
+				c.Invalidate()
+			})
 
 			// 分段开关整体压在 22pt 以内：外框 1pt 内边距加 12pt 行高的
 			// 10pt 文字，保证控件不被 header 裁掉，也不把 header 撑高。
@@ -241,11 +332,66 @@ func (a *selectorApp) header(c *ui.Context, pal palette, mode ThemeMode) {
 				Transition(fadeColors()).
 				Shrink(0).
 				Children(func() {
-					segment(c, "seg:auto", "系统", mode == ThemeAuto, pal, func() { a.setThemeMode(ThemeAuto, c) })
-					segment(c, "seg:light", "浅色", mode == ThemeLight, pal, func() { a.setThemeMode(ThemeLight, c) })
-					segment(c, "seg:dark", "深色", mode == ThemeDark, pal, func() { a.setThemeMode(ThemeDark, c) })
+					segment(c, "seg:auto", "系统", snap.themeMode == ThemeAuto, pal, func() { a.setThemeMode(ThemeAuto, c) })
+					segment(c, "seg:light", "浅色", snap.themeMode == ThemeLight, pal, func() { a.setThemeMode(ThemeLight, c) })
+					segment(c, "seg:dark", "深色", snap.themeMode == ThemeDark, pal, func() { a.setThemeMode(ThemeDark, c) })
 				})
 		})
+}
+
+// settingsControl 是 header 里的设置入口：menuHeaderHeight 见方，与关闭控件
+// 同一尺寸，因此不改变头部高度。它带无障碍名与 Tooltip，面板打开时保持
+// 按下态底色。
+//
+// 图标是三条滑杆（每条一根横线加一个小方块），不是齿轮：13pt 的画布上 8 齿
+// 齿轮会糊成一团，而"圆环 + 四齿"在真机上被误读成太阳/亮度。滑杆是 macOS
+// 里"可调参数"的通用隐喻，1.2pt 线宽 + 2.6pt 方块在 13pt 内仍然分得清。
+// 图形全部用 ui 图元自绘，不依赖字体里有没有 U+2699。
+//
+// 入口只有这一个加视图内的 ⌘,：不新增独立窗口、不加菜单栏常驻，也不改
+// Panel 语义（面板窗口不激活应用，标准 ⌘, 菜单命令永远收不到）。
+func settingsControl(c *ui.Context, pal palette, open bool, onToggle func()) {
+	btn := ui.Row(c).
+		Key("settingsGear").
+		Size(menuHeaderHeight, menuHeaderHeight).
+		Radius(5).
+		Center().
+		Background(ui.Transparent).
+		Cursor(ui.CursorPointer).
+		Role(ui.RoleButton).
+		Label("设置").
+		Tooltip("设置（⌘,）").
+		Transition(fadeColors())
+
+	switch {
+	case open:
+		btn.Background(pal.segActive)
+	case btn.Hovered():
+		btn.Background(pal.rowHover)
+	}
+	if btn.Pressed() {
+		btn.Background(pal.segBg)
+	}
+
+	btn.Children(func() {
+		// 13pt 画布：三条 1.2pt 滑轨，各带一枚 2.6pt 方块，方块错开位置才读
+		// 得出是"三个可调参数"，而不是一段列表。
+		ui.Box(c).Size(13, 13).Children(func() {
+			sliderRow := func(top, knobLeft float32) {
+				ui.Box(c).Absolute().Top(top).Left(0).Size(13, 1.2).
+					Radius(0.6).Background(pal.glyph)
+				ui.Box(c).Absolute().Top(top-0.7).Left(knobLeft).Size(2.6, 2.6).
+					Radius(0.9).Background(pal.glyph)
+			}
+			sliderRow(3, 3.2)
+			sliderRow(6.5, 8.4)
+			sliderRow(10, 5.6)
+		})
+	})
+
+	if btn.Clicked() {
+		onToggle()
+	}
 }
 
 // destination 是面板的视觉重点：一张整幅宽度的地址卡，域名以 24pt 粗体
@@ -276,7 +422,9 @@ func (a *selectorApp) destination(c *ui.Context, pal palette, snap snapshot) {
 		}
 		c.Invalidate()
 	}
-	if c.Shortcut(ui.Cmd, ui.KeyC) {
+	// 设置面板打开时 ⌘C 不复制：面板里没有可复制的输入，误触只会把链接
+	// 悄悄放进剪贴板，掩盖"面板期间不交付链接"的契约。
+	if c.Shortcut(ui.Cmd, ui.KeyC) && !snap.settingsOpen {
 		copyURL()
 	}
 
@@ -412,6 +560,273 @@ func (a *selectorApp) destination(c *ui.Context, pal palette, snap snapshot) {
 				}
 			})
 	})
+}
+
+// ============================================================================
+// 设置面板
+// ============================================================================
+
+// settingsUIState 是设置面板控件的绑定值。滑块与分段控件拿的是指针，必须
+// 跨帧稳定，因此不能指向 snapshot 的副本；这些字段只在主线程（渲染帧）读写。
+//
+// loaded/dark 记录绑定值对应哪一套外观：面板打开、恢复默认，或自动主题下
+// 外观翻转时，由 syncSettingsUI 把绑定值拉回设置文件里的当前值。
+type settingsUIState struct {
+	loaded     bool
+	dark       bool
+	background float64
+	card       float64
+	material   int
+	reduce     int
+}
+
+// syncSettingsUI 把面板控件的绑定值同步成设置里的当前值。
+func (a *selectorApp) syncSettingsUI(dark bool) {
+	ui := &a.settingsUI
+	if ui.loaded && ui.dark == dark {
+		return
+	}
+	a.mu.Lock()
+	ap := a.settings.Appearance.normalized()
+	motion := a.settings.Motion.normalized()
+	a.mu.Unlock()
+	if dark {
+		ui.background, ui.card = ap.BackgroundTint.Dark, ap.CardTint.Dark
+	} else {
+		ui.background, ui.card = ap.BackgroundTint.Light, ap.CardTint.Light
+	}
+	ui.material = materialIndex(ap.Material)
+	ui.reduce = 0
+	if motion.ReduceMotion == motionReduceOn {
+		ui.reduce = 1
+	}
+	ui.dark, ui.loaded = dark, true
+}
+
+// invalidateSettingsUI 让下一帧重新同步绑定值（打开面板、恢复默认时用）。
+func (a *selectorApp) invalidateSettingsUI() { a.settingsUI.loaded = false }
+
+// settingsOpenState 报告设置面板是否打开。
+func (a *selectorApp) settingsOpenState() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.settingsOpen
+}
+
+// toggleSettings 在身份列表与设置面板之间切换，并重排窗口高度。
+func (a *selectorApp) toggleSettings() {
+	a.setSettingsOpen(!a.settingsOpenState())
+}
+
+// closeSettings 关闭设置面板，并报告它此前是否打开——Esc 分层靠这个返回值
+// 区分"关面板"与"退出应用"。
+func (a *selectorApp) closeSettings() bool {
+	if !a.settingsOpenState() {
+		return false
+	}
+	a.setSettingsOpen(false)
+	return true
+}
+
+// setSettingsOpen 切换模式位、重排窗口高度，并在关闭时把设置冲刷到磁盘。
+//
+// 关闭时不重置选中项、不滚回顶部、不改列数：下一帧列表从同一状态重新画，
+// 选中卡照旧可见。面板高度是固定预算（panelSettingsHeight），所以打开与
+// 关闭都只改窗口高度。
+func (a *selectorApp) setSettingsOpen(open bool) {
+	a.mu.Lock()
+	if a.settingsOpen == open {
+		a.mu.Unlock()
+		return
+	}
+	a.settingsOpen = open
+	a.mu.Unlock()
+	if open {
+		a.invalidateSettingsUI()
+	} else {
+		a.flushSettings()
+	}
+	a.requestLayout(a.profileCount())
+}
+
+// settingsPanel 渲染设置面板，替换身份列表区。地址卡保留（当前链接与剩余
+// 条数仍在，它同时是「阅读面浓度」的实时预览对象），面板高度固定为
+// panelSettingsHeight，因此打开/关闭只改窗口高度，不改列数、滚动位置或身份
+// 顺序。所有控件都是框架控件：Tab 进入、方向键调值、自带无障碍标签与读数。
+func (a *selectorApp) settingsPanel(c *ui.Context, pal palette, dark bool) {
+	a.syncSettingsUI(dark)
+	// 系统「降低透明度」或「提高对比」时外观三项置灰只读：pal.opaque 已经把
+	// 界面切成实色表面，此时再调浓度与材质没有意义。不提供"忽略系统设置"
+	// 的开关——那是抢系统权威，也会让文字对比失控。
+	opaque := pal.opaque
+
+	ui.Scroll(c).Key("settings").Grow(1).Children(func() {
+		ui.Column(c).Gap(6).Padding(listShadowPad, listInset).Children(func() {
+			settingsGroupTitle(c, pal, "外观")
+			if opaque {
+				ui.Text(c, "系统已开启「降低透明度」或「提高对比」，界面使用不透明表面，外观三项暂不可调。").
+					FontSize(10).
+					TextColor(pal.textMuted).
+					Wrap()
+			}
+			a.tintSlider(c, pal, "背景浓度", &a.settingsUI.background, backgroundTintMin, backgroundTintMax, true, opaque)
+			a.tintSlider(c, pal, "阅读面浓度", &a.settingsUI.card, cardTintMin, cardTintMax, false, opaque)
+			a.materialPicker(c, pal, opaque)
+
+			settingsGroupTitle(c, pal, "动效")
+			a.motionSwitch(c, pal, "选中卡流彩", &a.settings.Motion.Spin)
+			a.motionSwitch(c, pal, "悬停放大与让位", &a.settings.Motion.Hover)
+			a.motionSwitch(c, pal, "3D 倾斜", &a.settings.Motion.Tilt)
+			a.reducePicker(c, pal)
+
+			settingsGroupTitle(c, pal, "操作")
+			a.resetControl(c, pal)
+		})
+	})
+}
+
+// settingsGroupTitle 是设置面板的分组标题：小字、低调，只做分段，不与控件
+// 争层级。
+func settingsGroupTitle(c *ui.Context, pal palette, title string) {
+	ui.Text(c, title).FontSize(10).FontWeight(600).TextColor(pal.textMuted).Shrink(0)
+}
+
+// formatTint 把覆盖不透明度显示成两位小数，与写进设置文件的精度一致。
+func formatTint(v float64) string { return fmt.Sprintf("%.2f", v) }
+
+// tintSlider 是"标签 + 当前读数 + 滑块"的一组：读数给出两位小数的真值，
+// 强度不只靠颜色深浅表达（数值本身可朗读）。
+//
+// 滑块写的是**当前外观那一侧**，并且先夹取量化再写设置；量化后的值回写给
+// 绑定值，保证读数、滑块与文件里写的是同一个数字。拖动期间只改内存并重绘，
+// 落盘留给面板关闭/退出前的 flushSettings。
+func (a *selectorApp) tintSlider(c *ui.Context, pal palette, label string, value *float64, lo, hi float64, background, disabled bool) {
+	ui.Column(c).Gap(1).Shrink(0).Children(func() {
+		ui.Row(c).Height(14).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, label).FontSize(11.5).TextColor(pal.textSecond).Shrink(0)
+			ui.Spacer(c)
+			ui.Text(c, formatTint(quantizeTint(*value, lo, hi))).
+				FontSize(11.5).
+				TextColor(pal.textMuted).
+				Shrink(0)
+		})
+		slider := ui.Slider(c, value, lo, hi).
+			Step(tintStep).
+			Label(label).
+			Disabled(disabled)
+		if slider.Changed() && !disabled {
+			*value = quantizeTint(*value, lo, hi)
+			if a.setTint(background, a.settingsUI.dark, *value) {
+				c.Invalidate()
+			}
+		}
+	})
+}
+
+// materialPicker 是磨砂材质的分段控件：四个用途材质，离散量不用滑块。标签
+// 独占一行，四个档位名与 settings.json 里的取值完全一致，手改文件时不会对
+// 不上号。切换走 Window.SetVibrancy + Window.Update，写 appearance.material。
+func (a *selectorApp) materialPicker(c *ui.Context, pal palette, disabled bool) {
+	ui.Column(c).Gap(2).Shrink(0).Children(func() {
+		ui.Text(c, "磨砂材质").FontSize(11.5).TextColor(pal.textSecond).Shrink(0)
+		seg := ui.Segmented(c, &a.settingsUI.material, materialOrder...).
+			Label("磨砂材质").
+			Disabled(disabled)
+		if seg.Changed() && !disabled {
+			a.pickMaterial(c)
+		}
+	})
+}
+
+// pickMaterial 把分段控件的档位落到设置与原生窗口：SetVibrancy 经
+// Window.Update 投递，避免在渲染帧中途重绘原生表面。
+func (a *selectorApp) pickMaterial(c *ui.Context) {
+	idx := a.settingsUI.material
+	if idx < 0 || idx >= len(materialOrder) {
+		idx = 0
+		a.settingsUI.material = 0
+	}
+	name := materialOrder[idx]
+	if !a.setMaterialSetting(name) {
+		return
+	}
+	if w := a.windowRef(); w != nil {
+		v := vibrancyForMaterial(name)
+		w.Update(func() { w.SetVibrancy(v) })
+	}
+	c.Invalidate()
+}
+
+// motionSwitch 是"标签 + 右侧开关"的一行。开关直接绑在设置字段上（地址跨帧
+// 稳定），Changed 时立刻写盘：这是离散改动，不存在拖动期间的高频写入。
+func (a *selectorApp) motionSwitch(c *ui.Context, pal palette, label string, on *bool) {
+	ui.Row(c).Height(22).AlignItems(ui.Center).Shrink(0).Children(func() {
+		ui.Text(c, label).FontSize(11.5).TextColor(pal.textSecond).Shrink(1).MinWidth(0)
+		ui.Spacer(c)
+		sw := ui.Switch(c, on).Label(label)
+		if sw.Changed() {
+			// 开关直接改的是内存设置字段，Changed 之后立刻写盘。
+			a.persistSettingsNow()
+			c.Invalidate()
+		}
+	})
+}
+
+// reducePicker 是减少动态效果的两档：跟随系统 / 强制开启。**没有**"强制
+// 关闭"——那会覆盖系统的 ReduceMotion。强制开启时所有几何动效归零，与系统
+// 开启时走同一条归零通路。
+func (a *selectorApp) reducePicker(c *ui.Context, pal palette) {
+	ui.Row(c).AlignItems(ui.Center).Shrink(0).Children(func() {
+		ui.Text(c, "减少动态效果").FontSize(11.5).TextColor(pal.textSecond).Shrink(0)
+		ui.Spacer(c)
+		seg := ui.Segmented(c, &a.settingsUI.reduce, "跟随系统", "强制开启").Label("减少动态效果")
+		if seg.Changed() {
+			mode := motionReduceSystem
+			if a.settingsUI.reduce == 1 {
+				mode = motionReduceOn
+			}
+			a.setMotionReduce(mode)
+			c.Invalidate()
+		}
+	})
+}
+
+// resetControl 是面板底部的"恢复默认"：浓度与材质耦合，用户很容易调成
+// "读不清也调不回来"，所以这个入口必须存在。
+func (a *selectorApp) resetControl(c *ui.Context, pal palette) {
+	btn := ui.Row(c).
+		Key("settingsReset").
+		Padding(4, 10).
+		Radius(7).
+		Background(pal.rowNormal).
+		Border(1, pal.border).
+		Cursor(ui.CursorPointer).
+		Role(ui.RoleButton).
+		Label("恢复默认").
+		Tooltip("恢复默认外观与动效，并立即生效").
+		Shrink(0)
+	if btn.Hovered() {
+		btn.Background(pal.rowHover)
+	}
+	btn.Children(func() {
+		ui.Text(c, "恢复默认").FontSize(11).FontWeight(500).TextColor(pal.textPrimary)
+	})
+	if btn.Clicked() {
+		a.resetToDefaults(c)
+	}
+}
+
+// resetToDefaults 把外观与动效恢复默认并立刻生效：设置写盘、原生材质换回
+// 默认档位、滑块绑定值下一帧重新同步。它是"调不回来"的兜底，因此不延迟
+// 落盘。
+func (a *selectorApp) resetToDefaults(c *ui.Context) {
+	a.resetSettings()
+	a.invalidateSettingsUI()
+	if w := a.windowRef(); w != nil {
+		v := vibrancyForMaterial(defaultAppearance().Material)
+		w.Update(func() { w.SetVibrancy(v) })
+	}
+	c.Invalidate()
 }
 
 // ============================================================================
@@ -598,19 +1013,15 @@ func (a *selectorApp) setReduceTransparency(v bool) {
 }
 
 // setThemeMode 同步界面与原生磨砂外观，避免文字与材质使用相反的主题。
+// 用户手动换主题时顺手把新值写回 settings.json——只在这一次写，不逐帧写。
 func (a *selectorApp) setThemeMode(m ThemeMode, c *ui.Context) {
 	a.mu.Lock()
 	a.themeMode = m
 	w := a.window
 	a.mu.Unlock()
+	a.persistTheme(m)
 	if w != nil {
-		source := mygo.ThemeSystem
-		switch m {
-		case ThemeLight:
-			source = mygo.ThemeLight
-		case ThemeDark:
-			source = mygo.ThemeDark
-		}
+		source := themeSource(m)
 		// 主题变更会重绘原生表面，放到下一轮主线程以避免渲染中途重入。
 		w.Update(func() { mygo.Theme.SetSource(source) })
 	}

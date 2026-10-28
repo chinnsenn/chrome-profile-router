@@ -1,5 +1,5 @@
-// [INPUT]: 依赖 mygo ui 的 PointerPosition / LayoutBounds / AnimateTo / Transform / Preferences；不读 selectorApp 状态。
-// [OUTPUT]: 提供身份卡片的悬停 3D 倾斜与内层视差位移（指针归一化、钳制、弹簧跟随、ReduceMotion 归零），不含缩放——放大与邻居让位归 hover_layout.go，供 profile_view.go 消费。
+// [INPUT]: 依赖 mygo ui 的 PointerPosition / LayoutBounds / AnimateTo / Transform；不读 selectorApp 状态，减少动态效果与倾斜开关由调用方传入。
+// [OUTPUT]: 提供身份卡片的悬停 3D 倾斜与内层视差位移（指针归一化、钳制、弹簧跟随、ReduceMotion 或设置里关掉倾斜时归零），不含缩放——放大与邻居让位归 hover_layout.go，供 profile_view.go 消费。
 // [POS]: 根包的动效层分片，纯装饰：不写选择、不改布局、不改命中区域与滚动位置。
 // [PROTOCOL]: 变更时更新此头部，然后检查 AGENTS.md
 package main
@@ -104,6 +104,11 @@ func clampUnit(v float32) float32 {
 // 内层视差位移（1.5pt 档，徽标按 cardParallaxBadge/cardParallaxContent
 // 放大）。
 //
+// enabled 是设置里的「3D 倾斜」开关：关掉时直接走与 ReduceMotion 相同的
+// 归零通路（over=false → 目标全零 → 变换为空），不另写一套几何，也不留
+// 空转的动画帧。reduceMotion 是这一帧生效的减少动态效果（系统偏好与
+// 强制开启取并集）。
+//
 // 变换链按 CSS 的等价顺序组合：CSS 的
 // `perspective(P) rotateX(rx) rotateY(ry)` 从左到右相乘为 P*Rx*Ry，而
 // MyGo 的 Then 是"先应用前者"，所以这里写成
@@ -116,10 +121,13 @@ func clampUnit(v float32) float32 {
 // 所有动画通道都挂在**交互层**元素上：它有稳定 Key，跨帧是同一个元素，
 // 弹簧不会被重建；倾斜只施加给内层视觉容器，交互层自己的盒子、详情浮层
 // 锚点与滚动位置都不变。
-func cardTilt(outer ui.Element, c *ui.Context) (tilt ui.Transform, shiftX, shiftY float32) {
+func cardTilt(outer ui.Element, enabled, reduceMotion bool) (tilt ui.Transform, shiftX, shiftY float32) {
 	px, py, over := outer.PointerPosition()
+	if !enabled {
+		over = false
+	}
 	box := outer.LayoutBounds() // 上一帧的布局盒，未受任何变换影响
-	rotX, rotY, shiftX, shiftY := cardTiltTarget(px, py, box.W, box.H, over, c.Preferences().ReduceMotion)
+	rotX, rotY, shiftX, shiftY := cardTiltTarget(px, py, box.W, box.H, over, reduceMotion)
 
 	a := cardTiltSpring()
 	rotX = outer.AnimateTo("tiltX", rotX, a)

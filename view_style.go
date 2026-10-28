@@ -1,5 +1,5 @@
-// [INPUT]: 依赖 ui.Color 与 ui.Animation 类型，由 view.go 和 profile_view.go 消费。
-// [OUTPUT]: 提供浅色/深色 × 原生磨砂/不透明（高对比或降低透明度）× 的调色板（目标卡、身份卡片、悬停/选中薄底、常态与选中卡的次行文字、头像描边、数字徽标与卡片/浮层投影），以及全局动效常量。
+// [INPUT]: 依赖 ui.Color 与 ui.Animation 类型，由 view.go 和 profile_view.go 消费；覆盖不透明度由 settings.go 的默认外观提供缺省值。
+// [OUTPUT]: 提供浅色/深色 × 原生磨砂/不透明（高对比或降低透明度）× 的调色板（目标卡、身份卡片、悬停/选中薄底、常态与选中卡的次行文字、头像描边、数字徽标与卡片/浮层投影），以及全局动效常量；根背景与地址卡的覆盖 alpha 由入参决定，不再写死。
 // [POS]: 根包的视觉层样式表，不含任何状态或布局逻辑。
 // [PROTOCOL]: 变更时更新此头部，然后检查 AGENTS.md
 package main
@@ -60,13 +60,29 @@ type palette struct {
 	glyph     ui.Color // 关闭按钮的笔画
 }
 
-// newPalette 按外观、窗口材质与无障碍偏好选择一组颜色。
+// newPalette 用默认外观渲染一帧，供不关心设置的调用方（离屏回归）使用；
+// 默认值来自 defaultAppearance，因此与设置文件缺省时的外观完全一致。
+func newPalette(dark, vibrancy, highContrast, reduceTransparency bool) palette {
+	def := defaultAppearance()
+	backgroundTint, cardTint := def.BackgroundTint.Dark, def.CardTint.Dark
+	if !dark {
+		backgroundTint, cardTint = def.BackgroundTint.Light, def.CardTint.Light
+	}
+	return newPaletteTinted(dark, vibrancy, highContrast, reduceTransparency, backgroundTint, cardTint)
+}
+
+// newPaletteTinted 是带覆盖不透明度的调色板：view.go 传入设置文件里当前
+// 外观那一侧的两个值。
 //
 // ui.Context 只暴露高对比；"降低透明度"由 view.go 从 mygo.Theme 读取后传入。
 // 二者任一成立、或窗口根本没有材质时，全部表面改为实色并去掉投影——投影
 // 在不透明底上只会脏成灰边，而实色本身已经给出足够的层级。根背景仅以薄层
 // 主题色覆盖，保留原生磨砂；手动主题由 view.go 同步原生外观。
-func newPalette(dark, vibrancy, highContrast, reduceTransparency bool) palette {
+//
+// backgroundTint/cardTint 是当前外观那一侧的覆盖不透明度，来自设置文件
+// （默认 0.30/0.34 与 0.62/0.66）。它们只决定覆盖的浓度，不改变模糊——
+// 原生材质的模糊由窗口负责，且没有半径可调。
+func newPaletteTinted(dark, vibrancy, highContrast, reduceTransparency bool, backgroundTint, cardTint float64) palette {
 	opaque := !vibrancy || highContrast || reduceTransparency
 
 	p := palette{opaque: opaque}
@@ -91,8 +107,8 @@ func newPalette(dark, vibrancy, highContrast, reduceTransparency bool) palette {
 			p.cardShadow = ui.Transparent
 			p.popShadow = ui.RGBA(0, 0, 0, 0.32)
 		} else {
-			p.window = ui.RGBA(22, 24, 29, 0.30)
-			p.destination = ui.RGBA(30, 34, 41, 0.62)
+			p.window = ui.RGBA(22, 24, 29, float32(backgroundTint))
+			p.destination = ui.RGBA(30, 34, 41, float32(cardTint))
 			p.popover = ui.RGBA(30, 34, 41, 0.72)
 			p.rowNormal = ui.RGBA(255, 255, 255, 0.032)
 			p.rowHover = ui.RGBA(255, 255, 255, 0.075)
@@ -142,8 +158,8 @@ func newPalette(dark, vibrancy, highContrast, reduceTransparency bool) palette {
 		p.cardShadow = ui.Transparent
 		p.popShadow = ui.RGBA(0, 0, 0, 0.18)
 	} else {
-		p.window = ui.RGBA(246, 246, 247, 0.34)
-		p.destination = ui.RGBA(255, 255, 255, 0.66)
+		p.window = ui.RGBA(246, 246, 247, float32(backgroundTint))
+		p.destination = ui.RGBA(255, 255, 255, float32(cardTint))
 		p.popover = ui.RGBA(255, 255, 255, 0.82)
 		p.rowNormal = ui.RGBA(255, 255, 255, 0.10)
 		p.rowHover = ui.RGBA(255, 255, 255, 0.34)
