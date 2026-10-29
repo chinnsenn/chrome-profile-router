@@ -74,7 +74,7 @@ secret。同一条标签的重跑是排队而不是取消，避免打断正在�
 
 | 平台 | 资产 | 命名来源 |
 | --- | --- | --- |
-| macOS arm64 / amd64 | `Chrome Profile Router 0.1.0 arm64.dmg`、`… amd64.dmg` | MyGo：`<name> <version> <arch>.dmg`，**文件名含空格** |
+| macOS arm64 / amd64 | `Chrome-Profile-Router-0.1.0-arm64.dmg`、`…-amd64.dmg` | MyGo 本地产出 `<name> <version> <arch>.dmg`（含空格）；staging 复制时把 basename 的空格换成 `-` |
 | Linux amd64 / arm64 | `chrome-profile-router_0.1.0_amd64.deb`、`…_arm64.deb` | MyGo：`<slug>_<deb 版本>_<arch>.deb` |
 | Linux amd64 / arm64 | `chrome-profile-router-0.1.0-linux-amd64.tar.gz`、`…arm64…` | 归档里含原版 `install.sh` |
 | Windows amd64 / arm64 | `chrome-profile-router-0.1.0-windows-amd64.zip`、`…arm64…` | 只含 exe + `install.cmd` + `uninstall.cmd` |
@@ -86,6 +86,15 @@ secret。同一条标签的重跑是排队而不是取消，避免打断正在�
   原样的版本字符串。
 - Windows 的 zip 来自 `packaging/package.sh`，MyGo 的 `Setup.exe`（NSIS）在打包时就被
   丢掉，不进 zip、也不进 Release。
+
+### DMG 的公开名
+
+MyGo 产出的 DMG 文件名带空格（`Chrome Profile Router <version> <arch>.dmg`），而 GitHub 在上传
+release asset 时会把空格规范化成 `.`（`Chrome.Profile.Router…`）——名字一变，`publish` 的远端
+逐字比对和 `SHA256SUMS` 就都对不上。所以 DMG 只在本地保留 MyGo 的写法，复制进 staging 时把
+basename 里的空格换成 `-`，公开名固定为 `Chrome-Profile-Router-<version>-<arch>.dmg`
+（版本串大小写照原样，例如 prerelease 的 `-rc.1` 不改写）。`SHA256SUMS` 只写这个规范名，
+`publish` 仍按规范名逐字比对远端清单，不做模糊匹配或名字改写。
 
 每个平台 job 先把自己那 2 / 4 / 2 个文件复制进 `$RUNNER_TEMP/release-assets` 这个
 **扁平** staging 目录，核对数目（macOS 2 个 DMG、Linux 2 个 .deb + 2 个 .tar.gz、
@@ -108,8 +117,8 @@ sha256sum -c SHA256SUMS
 shasum -a 256 -c SHA256SUMS
 ```
 
-含空格的 DMG 名在这个格式下同样能被解析；脚本写完会自己做一遍同样的读回校验，
-上传前再重新生成一次。
+清单里的名字就是远端的公开名（DMG 已按上文的连字符写法规范化），下载到同一目录后即可直接校验；
+脚本写完会自己做一遍同样的读回校验，上传前再重新生成一次。
 
 ## 签名与平台状态
 

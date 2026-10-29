@@ -55,10 +55,10 @@ README.md: 面向新访客的简明说明：定位、支持情况、安装、使
 docs/visual-design.md: 选中卡流彩与柔光的来源、固定 commit 链接与结构差异；视觉数值仍以源码常量为准。
 docs/platforms.md: 平台支持矩阵与验证记录：各平台的 Chrome 路径与启动方式、默认浏览器只注册为候选的边界、启动观察窗的语义，以及 Linux/Windows 已验证与未验证的清单。
 go.mod / go.sum: Go 工具链及固定依赖版本。
-mygo.json: Bundle 标识、URL scheme、文档类型、Linux 打包意图和版本的唯一声明来源（当前 `0.1.1`；发布标签是 `v` + 这个版本串，逐字一致，规则见 docs/releasing.md）。`linux.webview: false` 声明这是原生 UI（不加载网页），因此 `.deb` 只依赖 GTK3、安装脚本也不检查 WebKitGTK；删掉它会让 mygo 默认按 WebView 应用打包，凭空加上 libwebkit2gtk 依赖。
+mygo.json: Bundle 标识、URL scheme、文档类型、Linux 打包意图和版本的唯一声明来源（当前 `0.1.2`；发布标签是 `v` + 这个版本串，逐字一致，规则见 docs/releasing.md）。`linux.webview: false` 声明这是原生 UI（不加载网页），因此 `.deb` 只依赖 GTK3、安装脚本也不检查 WebKitGTK；删掉它会让 mygo 默认按 WebView 应用打包，凭空加上 libwebkit2gtk 依赖。
 
 约束
-- 版本只有 `mygo.json` 的 `version` 一处来源：不新增 `VERSION` 文件或 Go 常量，资产命名也不另立表。发布用 `v<SemVer>` 标签（只收 core + prerelease，拒绝 build metadata 与前导零），标签与 manifest 不一致或格式非法时，任何打包与发布都不得开始；普通分支与 PR 只校验、构建，不创建 Release。
+- 版本只有 `mygo.json` 的 `version` 一处来源：不新增 `VERSION` 文件或 Go 常量，资产命名也不另立表（DMG 的公开名固定为 `Chrome-Profile-Router-<version>-<arch>.dmg`：staging 复制时把 MyGo 本地名 basename 的空格换成 `-`，`release.sh` 的 `expected_assets` 用同一条规则推导——GitHub 上传 asset 会把名字里的空格规范化成 `.`，带空格的名字进不了 Release）。发布用 `v<SemVer>` 标签（只收 core + prerelease，拒绝 build metadata 与前导零），标签与 manifest 不一致或格式非法时，任何打包与发布都不得开始；普通分支与 PR 只校验、构建，不创建 Release。
 - `mygo.App.OnOpenURL` / `OnOpenFile` 统一入队；不再手动遍历启动参数，避免重复请求。
 - `openWith` 持锁时只调用 `targetLocked` / `currentLocked`；Chrome 启动在后台运行，结果经 Window.Update 回到主线程。
 - Esc 分层：设置面板打开时 Esc 只关闭面板并回到身份列表，面板已关时才退出应用；关闭按钮、⌘Q 与系统退出不受队列或动效拦截。除此之外 Esc 永远有效（启动中、错误、空状态下都能用），装饰性动效不能延迟键盘选择与链接交付。

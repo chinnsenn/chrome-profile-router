@@ -40,12 +40,13 @@ manifest_with_version() {
 }
 
 # 期望资产名按版本写死：这是对外契约，不能由 release.sh 自己算出来再自己比对。
+# DMG 是 staging 的公开名（空格换连字符），不是 MyGo 本地那个带空格的名字。
 expected_names() {
     case "$1" in
         0.1.0)
             printf '%s\n' \
-                "Chrome Profile Router 0.1.0 arm64.dmg" \
-                "Chrome Profile Router 0.1.0 amd64.dmg" \
+                "Chrome-Profile-Router-0.1.0-arm64.dmg" \
+                "Chrome-Profile-Router-0.1.0-amd64.dmg" \
                 "chrome-profile-router_0.1.0_amd64.deb" \
                 "chrome-profile-router_0.1.0_arm64.deb" \
                 "chrome-profile-router-0.1.0-linux-amd64.tar.gz" \
@@ -55,8 +56,8 @@ expected_names() {
             ;;
         0.1.0-rc.1)
             printf '%s\n' \
-                "Chrome Profile Router 0.1.0-rc.1 arm64.dmg" \
-                "Chrome Profile Router 0.1.0-rc.1 amd64.dmg" \
+                "Chrome-Profile-Router-0.1.0-rc.1-arm64.dmg" \
+                "Chrome-Profile-Router-0.1.0-rc.1-amd64.dmg" \
                 "chrome-profile-router_0.1.0~rc.1_amd64.deb" \
                 "chrome-profile-router_0.1.0~rc.1_arm64.deb" \
                 "chrome-profile-router-0.1.0-rc.1-linux-amd64.tar.gz" \
@@ -164,7 +165,7 @@ check_assets_rejected() { # desc dir version
 check_assets_ok "8 个资产齐 → 清单与期望一致" "$DIST" 0.1.0
 
 cp -a "$DIST" "$WORK/dist-missing"
-rm -f "$WORK/dist-missing/Chrome Profile Router 0.1.0 amd64.dmg"
+rm -f "$WORK/dist-missing/Chrome-Profile-Router-0.1.0-amd64.dmg"
 check_assets_rejected "缺一个 DMG → 失败" "$WORK/dist-missing" 0.1.0
 
 cp -a "$DIST" "$WORK/dist-empty"
@@ -172,7 +173,7 @@ cp -a "$DIST" "$WORK/dist-empty"
 check_assets_rejected "0 字节资产 → 失败" "$WORK/dist-empty" 0.1.0
 
 cp -a "$DIST" "$WORK/dist-extra"
-printf 'stray\n' >"$WORK/dist-extra/Chrome Profile Router 1.0.0 arm64.dmg"
+printf 'stray\n' >"$WORK/dist-extra/Chrome-Profile-Router-1.0.0-arm64.dmg"
 check_assets_rejected "混入旧版本资产 → 失败" "$WORK/dist-extra" 0.1.0
 
 RC_DIST="$WORK/dist-rc"
@@ -184,7 +185,7 @@ check_assets_ok "预发布资产的 .deb 用 ~rc.1 命名" "$RC_DIST" 0.1.0-rc.1
 SUM_DIST="$WORK/dist-sums"
 cp -a "$DIST" "$SUM_DIST"
 if release "$MANIFEST" sums "$SUM_DIST" 0.1.0 >"$WORK/sums.log" 2>&1; then
-    ok "sums 生成并自校验通过（含含空格的 DMG 名）"
+    ok "sums 生成并自校验通过（DMG 用 staging 规范名）"
 else
     bad "sums 失败：$(tail -1 "$WORK/sums.log")"
 fi
@@ -192,8 +193,8 @@ fi
 SUMS="$SUM_DIST/SHA256SUMS"
 [ -f "$SUMS" ] && [ "$(grep -c . "$SUMS")" = "8" ] &&
     ok "SHA256SUMS 是 8 行（不含自己）" || bad "SHA256SUMS 行数不是 8"
-grep -qE '^[0-9a-f]{64}  Chrome Profile Router 0\.1\.0 amd64\.dmg$' "$SUMS" &&
-    ok "SHA256SUMS 用 basename + 两个空格（DMG 名含空格）" ||
+grep -qE '^[0-9a-f]{64}  Chrome-Profile-Router-0\.1\.0-amd64\.dmg$' "$SUMS" &&
+    ok "SHA256SUMS 用 basename + 两个空格（DMG 用远端公开名，无空格）" ||
     bad "SHA256SUMS 的 DMG 行格式不对"
 grep -q 'dist/' "$SUMS" && bad "SHA256SUMS 里出现了目录前缀" || ok "SHA256SUMS 没有目录前缀"
 
@@ -234,10 +235,14 @@ case "$1" in
                         esac
                         ;;
                     *)
-                # 远端资产清单：默认与本地一致；GH_DROP 用来模拟少传了一个
+                        # 远端资产清单：默认与本地一致；GH_DROP 用来模拟少传了一个。
+                        # GitHub 上传 release asset 时会把文件名里的空格规范化成 '.'（真实事故：
+                        # "Chrome Profile Router 0.1.1 arm64.dmg" → "Chrome.Profile.Router.0.1.1.arm64.dmg"），
+                        # 这里如实模拟，清单比对因此不能假设远端会原样保留空格。
                         for f in "$GH_DIST"/*; do
                             n="$(basename "$f")"
                             [ "$n" = "${GH_DROP:-}" ] && continue
+                            n="${n// /.}"
                             printf '%s\t%s\n' "$(wc -c <"$f" | tr -d ' ')" "$n"
                         done
                         ;;

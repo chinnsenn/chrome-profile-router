@@ -72,7 +72,14 @@ jobs:
         run: |
           stage="$RUNNER_TEMP/release-assets"
           rm -rf "$stage" && mkdir -p "$stage"
-          cp build/darwin-*/*.dmg "$stage/"
+          # MyGo 的本地名是 "<name> <version> <arch>.dmg"（含空格），而 GitHub 上传 release
+          # asset 时会把空格规范化成 '.'，远端名字一变，release.sh 的清单比对与 SHA256SUMS
+          # 就都对不上。所以进 staging 时只把 basename 的空格换成 '-'（版本串原样保留），
+          # 包里的 app 与本地 MyGo 产物都不动。
+          for dmg in build/darwin-*/*.dmg; do
+            name="$(basename "$dmg")"
+            cp "$dmg" "$stage/${name// /-}"
+          done
           count="$(find "$stage" -maxdepth 1 -type f | wc -l | tr -d ' ')"
           [ "$count" = "2" ] || { echo "期望 2 个 DMG，实际 $count"; exit 1; }
           empty="$(find "$stage" -maxdepth 1 -type f -size 0 -print -quit)"

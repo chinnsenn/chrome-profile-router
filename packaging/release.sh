@@ -21,8 +21,10 @@
 # 数字段与数字 prerelease 标识符不允许前导零。
 #
 # 资产名来自 MyGo 与 packaging/package.sh 的实际命名（见 docs/releasing.md）：
-# macOS 的 DMG 带空格（<name> <version> <arch>.dmg），.deb 把 prerelease 的 '-'
-# 换成 '~'（0.1.0-rc.1 → 0.1.0~rc.1），tar.gz 与 zip 用连字符 slug。
+# macOS 的 DMG 在本地是 "<name> <version> <arch>.dmg"（含空格），进 staging 时把
+# basename 的空格换成 '-'——GitHub 上传 asset 时会把空格规范化成 '.'，带空格的
+# 名字在远端会变成 Chrome.Profile.Router…，与清单逐字比对就对不上；.deb 把
+# prerelease 的 '-' 换成 '~'（0.1.0-rc.1 → 0.1.0~rc.1），tar.gz 与 zip 用连字符 slug。
 
 set -euo pipefail
 
@@ -105,12 +107,15 @@ deb_version() {
 }
 
 # expected_assets：tag 发布必须齐的 8 个资产（顺序固定，便于日志比对）。
+# DMG 用 staging 的规范名：MyGo 本地名里的空格换成 '-'，版本串大小写照原样
+# （prerelease 的 -rc.1 不被改写），与 CI「Stage DMGs」的改名规则是同一条。
 expected_assets() {
-    local version="$1" deb
+    local version="$1" deb dmg
     deb="$(deb_version "$version")"
+    dmg="${APP_NAME// /-}"
     printf '%s\n' \
-        "${APP_NAME} ${version} arm64.dmg" \
-        "${APP_NAME} ${version} amd64.dmg" \
+        "${dmg}-${version}-arm64.dmg" \
+        "${dmg}-${version}-amd64.dmg" \
         "${SLUG}_${deb}_amd64.deb" \
         "${SLUG}_${deb}_arm64.deb" \
         "${SLUG}-${version}-linux-amd64.tar.gz" \
@@ -159,7 +164,8 @@ sha256_of() {
 }
 
 # cmd_sums：SHA256SUMS 只写 basename（不含目录前缀），不包含它自己，
-# 写完立刻用系统的校验命令读回一遍，确保含空格的 DMG 名也能被 -c 解析。
+# 写完立刻用系统的校验命令读回一遍，确保清单里的每个名字都能被 -c 解析；
+# 名字就是远端公开名（DMG 已按 staging 的规范名写出），下载后可直接校验。
 cmd_sums() {
     local dir="$1" version="$2" name sum names
     names="$(cmd_assets "$dir" "$version")"
