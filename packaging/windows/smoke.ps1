@@ -2,9 +2,9 @@
 #  Chrome Profile Router — Windows 包的 CI 冒烟（仅 CI 使用，终端用户不需要 PowerShell）
 # =============================================================================
 #  [INPUT]: build/windows-*/ 下由 packaging/package.sh 产出的 zip（优先本机架构）。
-#  [OUTPUT]: 退出码 0 表示通过；任何断言失败以 1 退出并打印原因。
+#  [OUTPUT]: 退出码 0 表示通过（含「卸载返回 0 时 uninstall.cmd 已同步自删」）；任何断言失败以 1 退出并打印原因。
 #  [POS]:    CI 专用：在隔离的 CI 用户里实跑 install.cmd / uninstall.cmd，
-#            验证候选键正确、用户默认关联未被改动、卸载只移除自己。
+#            验证候选键正确、用户默认关联未被改动、卸载只移除自己且脚本自身已消失。
 #  [PROTOCOL]: 变更时更新此头部，然后检查 AGENTS.md
 # =============================================================================
 $ErrorActionPreference = 'Stop'
@@ -132,7 +132,8 @@ if ($LASTEXITCODE -ne 0) { Fail "重复安装退出码 $LASTEXITCODE" }
 'keep me' | Set-Content -Path (Join-Path $appDir 'user-notes.txt') -Encoding utf8
 & cmd /c (Join-Path $appDir 'uninstall.cmd') | Out-Host
 if ($LASTEXITCODE -ne 0) { Fail "uninstall.cmd 退出码 $LASTEXITCODE" }
-Start-Sleep -Seconds 1
+# 自删除必须与退出码同步完成：返回 0 时脚本自己就该已经不在了，不靠等待掩盖时序
+if (Test-Path (Join-Path $appDir 'uninstall.cmd')) { Fail "卸载后卸载脚本仍在: $appDir\uninstall.cmd" }
 
 if (Test-Path $exe) { Fail "卸载后 exe 仍在: $exe" }
 Assert-NoKey $browserKey 'StartMenuInternet 候选'
