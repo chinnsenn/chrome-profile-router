@@ -1,5 +1,5 @@
 // [INPUT]: 依赖 launch_<goos>.go 提供的 launchChrome、Chrome 的 Local State 之外的运行状态，以及 mygo.Window 的 Update/Show。
-// [OUTPUT]: 在后台交付请求：成功才按请求 ID 出队，失败保留并回显原因；提供跨平台一致的「启动后观察窗口」语义。
+// [OUTPUT]: 在后台交付请求：成功才按请求 ID 出队，失败保留并回显原因；提供跨平台一致的「启动后观察窗口」语义，以及本次启动的完成信号（唯一 Wait 所有者的出口）。
 // [POS]: 根包的启动与交付层；平台差异在 launch_darwin.go / launch_linux.go / launch_windows.go。
 // [PROTOCOL]: 变更时更新此头部，然后检查 AGENTS.md
 package main
@@ -102,31 +102,40 @@ func chromeArgs(profileDir, target string) []string {
 // runDetached 启动 cmd 并给出「这次交付是否失败」的结论，绝不等待浏览器
 // 进程的生命周期。
 //
-//   - Start 失败：可执行文件不存在或不可执行，直接报错。
+//   - Start 失败：可执行文件不存在或不可执行，直接报错（没有完成信号）。
 //   - 在 grace 内以非零码退出：交付失败，请求必须留在队列里。
 //   - 在 grace 内以 0 退出：启动动作没有报错。
 //   - grace 内没有退出：启动动作没有报错；进程的回收交给后台 Wait，应用退出
 //     时不会被一起带走（见 launch_linux.go 的 detach）。
 //
 // 后两种都只表示"没有观察到失败"，不证明页面已经导航完成。
-func runDetached(cmd *exec.Cmd, grace time.Duration) error {
+//
+// done 是这次启动的完成信号，也是进程回收的唯一出口：下面的后台 goroutine 是
+// cmd.Wait 的唯一调用者，它把 Wait 的结果放进 done 并关闭它。生产路径不读
+// done（不等待浏览器生命周期）；只有需要确认「子进程已经结束」的调用方读它，
+// 读到即已被回收。进程在窗口内就退出时结果已经由返回的 error 给出，done 最终
+// 关闭——所以 done 只允许一个读者，且绝不能再有第二个 Wait。
+func runDetached(cmd *exec.Cmd, grace time.Duration) (<-chan error, error) {
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("启动 Chrome 失败: %w", err)
+		return nil, fmt.Errorf("启动 Chrome 失败: %w", err)
 	}
 
 	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
+	go func() {
+		done <- cmd.Wait()
+		close(done)
+	}()
 
 	timer := time.NewTimer(grace)
 	defer timer.Stop()
 	select {
 	case err := <-done:
 		if err != nil {
-			return fmt.Errorf("Chrome 启动后立即退出（%v）", err)
+			return done, fmt.Errorf("Chrome 启动后立即退出（%v）", err)
 		}
-		return nil
+		return done, nil
 	case <-timer.C:
-		return nil
+		return done, nil
 	}
 }
 

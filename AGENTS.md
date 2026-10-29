@@ -14,10 +14,10 @@ chrome.go: Profile 发现的解析层——读取 Chrome 的 `Local State`，按
 chrome_darwin.go: macOS 的 Chrome 用户数据根目录（`~/Library/Application Support/Google/Chrome`），逐字保持已发布行为。
 chrome_linux.go: Linux 的根目录与可执行文件事实：`$XDG_CONFIG_HOME/google-chrome`（为空或相对则 `~/.config/google-chrome`）、PATH 上的 `google-chrome` → `google-chrome-stable`；不解析 Chromium/Flatpak/Snap。
 chrome_windows.go: Windows 的根目录与可执行文件事实：`%LOCALAPPDATA%\Google\Chrome\User Data`（取不到即报错，不回退 USERPROFILE）、`chrome.exe` 按 LOCALAPPDATA → ProgramFiles → ProgramFiles(x86) 顺序查找，缺失时列出已查找路径；不读注册表。
-launch.go: 交付层——`openWith` 在后台启动 Chrome、成功才按请求 ID 出队、失败保留并可重试；`chromeArgs` 只产出两个独立参数（Profile 目录与目标 URL，中文/空格/查询串原样交给 exec 加引号）；`runDetached` 用 `launchGrace`(700ms) 观察窗给出「这次交付是否失败」，窗口内未退出只表示没有观察到失败，不证明页面已导航完成，也不等待浏览器生命周期。
+launch.go: 交付层——`openWith` 在后台启动 Chrome、成功才按请求 ID 出队、失败保留并可重试；`chromeArgs` 只产出两个独立参数（Profile 目录与目标 URL，中文/空格/查询串原样交给 exec 加引号）；`runDetached` 用 `launchGrace`(700ms) 观察窗给出「这次交付是否失败」，窗口内未退出只表示没有观察到失败，不证明页面已导航完成，也不等待浏览器生命周期；`runDetached` 另返回本次启动的完成信号（带缓冲的 `<-chan error`，由唯一的后台 `cmd.Wait` 写入并关闭）——它是进程回收的唯一出口，生产路径不读，只有需要确认子进程已结束的调用方读，读到即已被回收，且绝不允许第二个 Wait。
 launch_darwin.go: macOS 的 launchChrome：`/usr/bin/open -n -b com.google.Chrome --args --profile-directory=… URL`，8s 超时，参数与文案保持原样。
-launch_linux.go: Linux 的 launchChrome：直启 PATH 上的 Chrome，`setsid` 进入独立会话（应用交付完退出时不带走浏览器），再交给 runDetached。
-launch_windows.go: Windows 的 launchChrome：直启 chrome.exe 再交给 runDetached；不加进程创建标志（父进程退出后浏览器是否存活尚未验证，见 docs/platforms.md）。
+launch_linux.go: Linux 的 launchChrome：直启 PATH 上的 Chrome，`setsid` 进入独立会话（应用交付完退出时不带走浏览器），再交给 runDetached（丢弃完成信号——交付路径不等待浏览器生命周期）。
+launch_windows.go: Windows 的 launchChrome：直启 chrome.exe 再交给 runDetached（丢弃完成信号——交付路径不等待浏览器生命周期）；不加进程创建标志（父进程退出后浏览器是否存活尚未验证，见 docs/platforms.md）。
 destination.go: 整幅宽度的地址卡：域名主行、路径/启动中/失败原因次行、队列剩余徽标、复制按钮；复制走 `mygo.Clipboard` 的跨平台实现（不再调用 pbcopy），失败可回显；设置面板打开时快捷键不复制。
 settings_panel.go: 设置面板的控件与绑定（两个浓度滑块、四档材质、三个动效开关、两档减少动态效果、恢复默认）以及面板模式位与 Esc 分层所需的开关函数；替换身份列表区、高度固定，关闭时冲刷设置。
 shortcut_darwin.go: macOS 的快捷键文案（`⌘`+键）。
@@ -45,8 +45,8 @@ chrome_test.go: `loadProfilesFrom` 的解析契约：缺文件/坏 JSON/空条�
 chrome_darwin_test.go: macOS 根目录仍是 `~/Library/Application Support/Google/Chrome`。
 chrome_linux_test.go: Linux 根目录的 XDG 优先级（含相对路径被忽略）与 PATH 上 Stable 命令的查找顺序、缺失时的可读错误。
 chrome_windows_test.go: Windows 根目录只在 LOCALAPPDATA 下解析、缺失即报错，`chrome.exe` 的 per-user 优先顺序与缺失时列出已查找路径。
-helper_test.go: 测试二进制作为假 Chrome 的 TestMain 分支（argv 落盘 / 非零退出 / 长驻等待释放文件）、newHelperCommand 与 waitFor（等状态而不是等固定时长）；进程边界断言不依赖本机 Chrome，长驻 helper 由 t.Cleanup 释放，不留后台进程。
-launch_test.go: `runDetached` 的三类结局（立即非零失败、干净早退、长驻时按观察窗返回）；队列的交付状态由平台测试文件经真实 `openWith` 覆盖。
+helper_test.go: 测试二进制作为假 Chrome 的 TestMain 分支（argv 落盘 / 非零退出 / 长驻等待释放文件）、newHelperCommand、waitFor（等状态而不是等固定时长）与 stopHelper（等 runDetached 交出的完成信号；释放没送达或超时先杀进程再等同一信号）；进程边界断言不依赖本机 Chrome，长驻 helper 由 t.Cleanup 释放并确认已被回收，不留后台进程。
+launch_test.go: `runDetached` 的三类结局（立即非零失败、干净早退、长驻时按观察窗返回）——长驻用例断言返回不早于观察窗、返回时完成信号尚未到达（子进程仍活），清理时写释放文件并等同一完成信号，超时才杀进程且仍等它，因此测试结束前子进程必已被回收；队列的交付状态由平台测试文件经真实 `openWith` 覆盖。
 launch_linux_test.go: Linux 端到端——从 PATH 找到假 chrome，profile 目录与目标 URL（中文、空格、&、#、本地文件路径）原样到达子进程，缺 Chrome 时不启动；另经真实 `openWith` 覆盖「失败保留请求」「成功后出队且收起 loading」。
 launch_windows_test.go: Windows 端到端——从 LOCALAPPDATA 找到假 chrome.exe，同样的参数保真、URL 用 url.Parse 独立校验、缺 Chrome 报错，以及同样的 `openWith` 交付状态。
 settings_test.go: 设置文件的首次生成默认值、损坏回落不覆盖、越界夹取、未知键容错、`version:2` 不回写、未知材质回落 popover、主题往返、motion 缺键/部分缺键/未知 reduceMotion 的回落、motion 层未知键在写盘后仍保留、恢复默认立即落盘、浓度只写当前外观那一侧且量化到 0.02 的行为边界（只写临时目录）。
@@ -55,7 +55,7 @@ README.md: 面向新访客的简明说明：定位、支持情况、安装、使
 docs/visual-design.md: 选中卡流彩与柔光的来源、固定 commit 链接与结构差异；视觉数值仍以源码常量为准。
 docs/platforms.md: 平台支持矩阵与验证记录：各平台的 Chrome 路径与启动方式、默认浏览器只注册为候选的边界、启动观察窗的语义，以及 Linux/Windows 已验证与未验证的清单。
 go.mod / go.sum: Go 工具链及固定依赖版本。
-mygo.json: Bundle 标识、URL scheme、文档类型、Linux 打包意图和版本的唯一声明来源（当前 `0.1.0`；发布标签是 `v` + 这个版本串，逐字一致，规则见 docs/releasing.md）。`linux.webview: false` 声明这是原生 UI（不加载网页），因此 `.deb` 只依赖 GTK3、安装脚本也不检查 WebKitGTK；删掉它会让 mygo 默认按 WebView 应用打包，凭空加上 libwebkit2gtk 依赖。
+mygo.json: Bundle 标识、URL scheme、文档类型、Linux 打包意图和版本的唯一声明来源（当前 `0.1.1`；发布标签是 `v` + 这个版本串，逐字一致，规则见 docs/releasing.md）。`linux.webview: false` 声明这是原生 UI（不加载网页），因此 `.deb` 只依赖 GTK3、安装脚本也不检查 WebKitGTK；删掉它会让 mygo 默认按 WebView 应用打包，凭空加上 libwebkit2gtk 依赖。
 
 约束
 - 版本只有 `mygo.json` 的 `version` 一处来源：不新增 `VERSION` 文件或 Go 常量，资产命名也不另立表。发布用 `v<SemVer>` 标签（只收 core + prerelease，拒绝 build metadata 与前导零），标签与 manifest 不一致或格式非法时，任何打包与发布都不得开始；普通分支与 PR 只校验、构建，不创建 Release。

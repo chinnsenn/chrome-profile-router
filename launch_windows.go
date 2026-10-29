@@ -8,12 +8,14 @@ import (
 	"os/exec"
 )
 
-// launchChrome 直接启动 chrome.exe，由 runDetached 判定这次交付是否失败。
+// launchChrome 直接启动 chrome.exe，由 runDetached 判定这次交付是否失败；
+// 完成信号在这里丢弃——交付路径不等待浏览器生命周期。
 func launchChrome(profileDir, target string) error {
 	exe, err := chromeExecutable()
 	if err != nil {
 		return err
 	}
 	cmd := exec.Command(exe, chromeArgs(profileDir, target)...)
-	return runDetached(cmd, launchGrace)
+	_, err = runDetached(cmd, launchGrace)
+	return err
 }
