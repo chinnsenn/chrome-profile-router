@@ -1,5 +1,5 @@
 // [INPUT]: 依赖 selectorApp 的请求队列、MyGo 内容动画及主线程投递。
-// [OUTPUT]: 提供仅内容层的入场与可中断异步出场；新请求取消自然退出，显式关闭保留退出意图。
+// [OUTPUT]: 提供仅内容层的入场与可中断异步出场；新请求取消自然退出，显式关闭保留退出意图；panelMotion 另记最近一次成功交付的地址（delivered），供出场帧显示诚实文案。
 // [POS]: 根包的内容生命周期；不改变原生窗口透明度，不拦截系统退出。
 // [PROTOCOL]: 变更时更新此头部，然后检查 AGENTS.md
 package main
@@ -27,6 +27,10 @@ type panelMotion struct {
 	run    uint64
 	first  time.Time
 	queued bool
+	// delivered 是最近一次成功交付的地址，只在出场帧使用：队列出队后
+	// 地址卡不再回落成默认主页，而是继续显示真正交付的地址与「已交给
+	// Chrome」。由 launch.go 的 noteDelivered 写入，受 a.mu 保护。
+	delivered string
 }
 
 // resetEntry 在 Show 前调用；同一帧的所有布局 pass 都保留起始画面。

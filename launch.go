@@ -1,5 +1,5 @@
 // [INPUT]: 依赖 launch_<goos>.go 提供的 launchChrome、Chrome 的 Local State 之外的运行状态，以及 mygo.Window 的 Update/Show。
-// [OUTPUT]: 在后台交付请求：成功才按请求 ID 出队，失败保留并回显原因；提供跨平台一致的「启动后观察窗口」语义，以及本次启动的完成信号（唯一 Wait 所有者的出口）。
+// [OUTPUT]: 在后台交付请求：beginLaunch 在选中同一帧写入启动状态并请求重绘，completeLaunch 成功才按请求 ID 出队、失败保留并回显原因；成功交付至少保持 launchMinFeedback 的可见 loading（只在后台 goroutine 里推迟回写，不等待浏览器生命周期），并记下真正交付的地址供出场帧显示诚实文案；提供跨平台一致的「启动后观察窗口」语义，以及本次启动的完成信号（唯一 Wait 所有者的出口）。
 // [POS]: 根包的启动与交付层；平台差异在 launch_darwin.go / launch_linux.go / launch_windows.go。
 // [PROTOCOL]: 变更时更新此头部，然后检查 AGENTS.md
 package main
@@ -27,6 +27,16 @@ const launchTimeout = 8 * time.Second
 // 的退出时序记录在 docs/platforms.md 的 smoke 结果里。
 const launchGrace = 700 * time.Millisecond
 
+// launchMinFeedback 是「正在启动 Chrome…」至少可见的时长。
+//
+// macOS 的交付走 /usr/bin/open，常常 100ms 内就返回；若立刻收起 loading 并
+// 出场，用户只会看到一帧闪烁，从选中到 Chrome 窗口出现之间反而是一段没有
+// 反馈的空档。这里保证加载反馈至少停留这么久：它只推迟状态回写（在后台
+// goroutine 里等），不阻塞 UI 线程，也不参与出场判定——出场仍然只由三个
+// 动画通道的 Settled 决定，绝不等待浏览器生命周期。失败不补时长：错误会
+// 一直留在界面上，等它没有意义。
+const launchMinFeedback = 500 * time.Millisecond
+
 // openWith 在后台 goroutine 中启动 Chrome，绝不阻塞 UI 线程。
 //
 // 成功且没有错误时：把本次消费的请求 ID 交给队列推进逻辑，由 Update 决定
@@ -37,57 +47,96 @@ const launchGrace = 700 * time.Millisecond
 // targetLocked()（非重入内核），绝不能调用会二次 Lock 的 target() / current()，
 // 否则 sync.Mutex 不可重入会导致 UI 主线程永久死锁。
 func (a *selectorApp) openWith(p Profile) {
+	target, launchedID, ok := a.beginLaunch()
+	if !ok {
+		return
+	}
+
+	w := a.windowRef()
+
+	go func() {
+		start := time.Now()
+		err := launchChrome(p.Dir, target)
+
+		// 成功交付时补足最短可见时长：只推迟回写，不阻塞界面，也不等待
+		// 浏览器生命周期（观察窗的语义没有变化）。
+		if err == nil {
+			if d := launchMinFeedback - time.Since(start); d > 0 {
+				time.Sleep(d)
+			}
+		}
+
+		if w == nil {
+			// 窗口尚未就绪（极早期触发），直接同步收尾。收尾顺序必须与
+			// 窗口路径一致：先收起 loading，再推进队列——否则成功交付后
+			// launching 会一直为真，面板永远停在「正在启动 Chrome…」。
+			a.completeLaunch(target, launchedID, err)
+			return
+		}
+
+		// 所有状态写回都在 main thread 上完成，避免数据竞争。
+		w.Update(func() {
+			a.completeLaunch(target, launchedID, err)
+		})
+	}()
+}
+
+// beginLaunch 在选中发生的同一帧写入启动状态并请求重绘，返回本次要打开的
+// 目标与消费的请求 ID。返回 false 表示已有启动在进行中（防重入），或目标
+// 解析失败（失败原因已写回界面）。
+//
+// 它只做状态写入、不启动进程，所以 loading 与用户的选中在同一帧生效，不会
+// 晚一帧出现。
+func (a *selectorApp) beginLaunch() (target string, launchedID uint64, ok bool) {
 	a.mu.Lock()
 	if a.launching {
 		a.mu.Unlock()
-		return
+		return "", 0, false
 	}
 	target, err := a.targetLocked()
 	if err != nil {
 		a.launchError = err.Error()
 		a.mu.Unlock()
 		a.showPanel()
-		return
+		return "", 0, false
 	}
 
 	// 记录本次启动实际消费的请求 ID（0 表示并无队列请求，走 HomeURL）。
 	// 出队必须以 ID 为准，不能用"删队首"这种位置假设。
-	var launchedID uint64
 	if head, ok := a.currentLocked(); ok {
 		launchedID = head.ID
 	}
 
 	a.launching = true
 	a.launchError = ""
+	// 上一轮的交付地址只用于出场帧文案，新一次启动先清掉。
+	a.motion.delivered = ""
 	a.mu.Unlock()
 
-	w := a.windowRef()
-	if w != nil {
+	if w := a.windowRef(); w != nil {
 		w.Invalidate()
 	}
+	return target, launchedID, true
+}
 
-	go func() {
-		err := launchChrome(p.Dir, target)
+// completeLaunch 把启动结果写回界面，必须在主线程调用：失败保留请求并
+// 回显原因（可原地重试），成功记住交付的地址后按 ID 推进队列。
+func (a *selectorApp) completeLaunch(target string, launchedID uint64, err error) {
+	a.finishLaunch(err)
+	if err != nil {
+		return
+	}
+	a.noteDelivered(target)
+	a.advanceQueue(launchedID)
+}
 
-		if w == nil {
-			// 窗口尚未就绪（极早期触发），直接同步收尾。收尾顺序必须与
-			// 窗口路径一致：先收起 loading，再推进队列——否则成功交付后
-			// launching 会一直为真，面板永远停在「正在启动 Chrome…」。
-			a.finishLaunch(err)
-			if err == nil {
-				a.advanceQueue(launchedID)
-			}
-			return
-		}
-
-		// 所有状态写回都在 main thread 上完成，避免数据竞争。
-		w.Update(func() {
-			a.finishLaunch(err)
-			if err == nil {
-				a.advanceQueue(launchedID)
-			}
-		})
-	}()
+// noteDelivered 记住本次真正交付的地址。出场帧据此继续显示这条地址，并
+// 用「已交给 Chrome」代替默认主页的说明——交付成功但页面是否打开不可观测，
+// 所以既不回落成"未收到外部链接"，也不宣称页面已经打开。
+func (a *selectorApp) noteDelivered(target string) {
+	a.mu.Lock()
+	a.motion.delivered = target
+	a.mu.Unlock()
 }
 
 // chromeArgs 返回交给 Chrome 的参数：先选 Profile 目录，再给目标地址。

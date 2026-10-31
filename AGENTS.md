@@ -14,26 +14,26 @@ chrome.go: Profile 发现的解析层——读取 Chrome 的 `Local State`，按
 chrome_darwin.go: macOS 的 Chrome 用户数据根目录（`~/Library/Application Support/Google/Chrome`），逐字保持已发布行为。
 chrome_linux.go: Linux 的根目录与可执行文件事实：`$XDG_CONFIG_HOME/google-chrome`（为空或相对则 `~/.config/google-chrome`）、PATH 上的 `google-chrome` → `google-chrome-stable`；不解析 Chromium/Flatpak/Snap。
 chrome_windows.go: Windows 的根目录与可执行文件事实：`%LOCALAPPDATA%\Google\Chrome\User Data`（取不到即报错，不回退 USERPROFILE）、`chrome.exe` 按 LOCALAPPDATA → ProgramFiles → ProgramFiles(x86) 顺序查找，缺失时列出已查找路径；不读注册表。
-launch.go: 交付层——`openWith` 在后台启动 Chrome、成功才按请求 ID 出队、失败保留并可重试；`chromeArgs` 只产出两个独立参数（Profile 目录与目标 URL，中文/空格/查询串原样交给 exec 加引号）；`runDetached` 用 `launchGrace`(700ms) 观察窗给出「这次交付是否失败」，窗口内未退出只表示没有观察到失败，不证明页面已导航完成，也不等待浏览器生命周期；`runDetached` 另返回本次启动的完成信号（带缓冲的 `<-chan error`，由唯一的后台 `cmd.Wait` 写入并关闭）——它是进程回收的唯一出口，生产路径不读，只有需要确认子进程已结束的调用方读，读到即已被回收，且绝不允许第二个 Wait。
+launch.go: 交付层——`beginLaunch` 在选中同一帧写入启动状态并请求重绘（loading 不晚一帧出现），`completeLaunch` 在后台启动 Chrome、成功才按请求 ID 出队、失败保留并可重试；成功交付至少保持 `launchMinFeedback`(500ms) 的可见 loading（只在后台 goroutine 里推迟回写，不阻塞界面、不等待浏览器生命周期、失败不补时长），并记下真正交付的地址供出场帧显示诚实文案；`chromeArgs` 只产出两个独立参数（Profile 目录与目标 URL，中文/空格/查询串原样交给 exec 加引号）；`runDetached` 用 `launchGrace`(700ms) 观察窗给出「这次交付是否失败」，窗口内未退出只表示没有观察到失败，不证明页面已导航完成，也不等待浏览器生命周期；`runDetached` 另返回本次启动的完成信号（带缓冲的 `<-chan error`，由唯一的后台 `cmd.Wait` 写入并关闭）——它是进程回收的唯一出口，生产路径不读，只有需要确认子进程已结束的调用方读，读到即已被回收，且绝不允许第二个 Wait。
 launch_darwin.go: macOS 的 launchChrome：`/usr/bin/open -n -b com.google.Chrome --args --profile-directory=… URL`，8s 超时，参数与文案保持原样。
 launch_linux.go: Linux 的 launchChrome：直启 PATH 上的 Chrome，`setsid` 进入独立会话（应用交付完退出时不带走浏览器），再交给 runDetached（丢弃完成信号——交付路径不等待浏览器生命周期）。
 launch_windows.go: Windows 的 launchChrome：直启 chrome.exe 再交给 runDetached（丢弃完成信号——交付路径不等待浏览器生命周期）；不加进程创建标志（父进程退出后浏览器是否存活尚未验证，见 docs/platforms.md）。
-destination.go: 整幅宽度的地址卡：域名主行、路径/启动中/失败原因次行、队列剩余徽标、复制按钮；复制走 `mygo.Clipboard` 的跨平台实现（不再调用 pbcopy），失败可回显；设置面板打开时快捷键不复制。
+destination.go: 整幅宽度的地址卡：域名主行、路径/启动中/失败原因次行、队列剩余徽标、复制按钮；启动中的文案是与选中身份卡共用的 `launchingNote` 且次行改用强调色（字号 12.5pt、行高 15pt 与卡片 72pt 高度都不变），指示器 13pt 用 Spinner、减少动态效果下换成静态强调色描边圆环（不自调度、不调 Keyframes，因此没有空转动画），指示器的无障碍名 `loadingIndicatorLabel` 与可见文案分开（回归测试才能精确计数），出场帧显示真正交付的地址与「已交给 Chrome」，绝不回落成「未收到外部链接 · 默认打开主页」；复制走 `mygo.Clipboard` 的跨平台实现（不再调用 pbcopy），失败可回显；设置面板打开时快捷键不复制。
 settings_panel.go: 设置面板的控件与绑定（两个浓度滑块、四档材质、三个动效开关、两档减少动态效果、恢复默认）以及面板模式位与 Esc 分层所需的开关函数；替换身份列表区、高度固定，关闭时冲刷设置。
 shortcut_darwin.go: macOS 的快捷键文案（`⌘`+键）。
 shortcut_other.go: 非 macOS 的快捷键文案（`Ctrl+`+键）；绑定本身来自 ui.Cmd，文案只影响提示。
 fileurl_other.go: 非 Windows 的 file URL 组成：POSIX 路径没有 host，path 原样交给 url.URL 转义。
 fileurl_windows.go: Windows 的 file URL 组成：盘符路径补前导 `/` 得到 `file:///C:/…`，UNC 的 server 作为 host 得到 `file://server/share/…`，反斜线一次性换成 `/`，绝不让 `%5C` 或「C: 被当成 scheme」进入 URL。
 settings.go: `<PathUserData>/settings.json` 的读写层（版本号 + 外观分组 theme/material/backgroundTint/cardTint + 动效分组 motion.spin/hover/tilt/reduceMotion）；首次运行原子写入默认值文件，缺失/损坏/未知键/越界/更新版本各自按默认值、夹取或只读运行，不覆盖用户文件；写盘前先读回旧文件按层合并，保留用户手改的未知键（顶层、appearance 与 motion 内），已知字段以内存中夹取后的值为准；材质名只收 mygo 的 macOS 材质常量，未知回落 popover；动效分组整组缺失时回落全开 + system，未知 reduceMotion 回落 system（没有 off）；面板改动走内存写入 + 标脏，离散项与关闭面板/退出前冲刷，滑块拖动期间不逐帧写盘；不碰原生窗口。
-motion.go: 内容层的入场与可中断出场生命周期（180ms 淡入 / 120ms 出场、缩放与 Y 位移、仅内容层降透明度）；以动画通道 Settled 判定完成并经 Window.Update 投递后 Quit，新请求在同一把锁下取消自然出场，显式关闭不被取消。
+motion.go: 内容层的入场与可中断出场生命周期（180ms 淡入 / 120ms 出场、缩放与 Y 位移、仅内容层降透明度）；以动画通道 Settled 判定完成并经 Window.Update 投递后 Quit，新请求在同一把锁下取消自然出场，显式关闭不被取消；`panelMotion.delivered` 记录最近一次成功交付的地址，只在出场帧用于地址卡的诚实文案（不改出场时机，也不参与完成判定）。
 layout.go: 单列与三列画廊共享的列数、卡片高度、头像/徽标尺寸和窗口尺寸预算；固定控件高度推导窗口尺寸，不预留未显示状态的空白；另提供设置面板的固定高度预算 panelSettingsHeight 与 settingsPanelSize（宽度沿用列表预算、高度固定，不参与 panelChromeBase/panelChrome 的推导）。
 hover_layout.go: 悬停放大与邻居让位的纯几何（网格同排沿 x 放大到 1.06、单列沿 y 增高到 1.08，邻居按 1/(1+d) 距离权重缩窄并移位，带首尾外边界与卡片间距保持不变，交叉轴只吃列表内缩/行间距余量）；零逐帧分配、不读指针与应用状态，静止时返回单位变换。
-view.go: 身份画廊与用户输入，指针/键盘意图转成选择、启动与退出；手动主题同步原生磨砂外观；header 右侧的设置图标（三条滑杆，13pt 自绘，不用齿轮以免被误读成太阳/亮度）与视图内快捷键切换设置面板（文案按平台来自 shortcut_<goos>.go），Esc 分层与面板期间的键盘屏蔽也在这里；地址卡在 destination.go，面板控件在 settings_panel.go。
-profile_view.go: 单列与三列共用身份卡片（身份色细条、32pt 真实头像、名称/邮箱两行、数字键徽标），拆成不随悬停变化的布局槽位、承载放大/让位并接收指针的可交互层、以及只做倾斜的内层表面三层，槽位盒子不随悬停移动；三个动效开关在这里落到绘制上（关掉流彩只保留静态基础边框与柔光且不调 Keyframes，关掉悬停放大走与 ReduceMotion 相同的单位变换，关掉倾斜不旋转不视差）；槽位 PassThrough 退出命中登记，命中与悬停只由已变换的交互层决定，可见边缘与可点边缘一致；悬停归属由窗口坐标与上一帧几何（可见矩形→静止槽位）判定，动画不能自己切走悬停；提供无障碍描述、悬停 Tooltip 与空格详情浮层。
+view.go: 身份画廊与用户输入，指针/键盘意图转成选择、启动与退出；手动主题同步原生磨砂外观；header 右侧的设置图标（三条滑杆，13pt 自绘，不用齿轮以免被误读成太阳/亮度）与视图内快捷键切换设置面板（文案按平台来自 shortcut_<goos>.go），Esc 分层与面板期间的键盘屏蔽也在这里；snapshot 另带出场相位与最近交付地址（exiting/delivered），只供地址卡在出场帧显示诚实文案；地址卡在 destination.go，面板控件在 settings_panel.go。
+profile_view.go: 单列与三列共用身份卡片（身份色细条、32pt 真实头像、名称/邮箱两行、数字键徽标）；启动中真正被交付的那张卡把副行换成与地址卡相同的 `launchingNote` 并改用强调色（压过选中卡常态的 `textOnChosen`，不因 `isChosen` 覆盖而变成死代码；opaque 表面同样成立），因此选中到 Chrome 打开之间有两处可见反馈；点击非选中卡时先把选择挪到这张卡再交付，loading 只画在真正被交付的卡上；拆成不随悬停变化的布局槽位、承载放大/让位并接收指针的可交互层、以及只做倾斜的内层表面三层，槽位盒子不随悬停移动；三个动效开关在这里落到绘制上（关掉流彩只保留静态基础边框与柔光且不调 Keyframes，关掉悬停放大走与 ReduceMotion 相同的单位变换，关掉倾斜不旋转不视差）；槽位 PassThrough 退出命中登记，命中与悬停只由已变换的交互层决定，可见边缘与可点边缘一致；悬停归属由窗口坐标与上一帧几何（可见矩形→静止槽位）判定，动画不能自己切走悬停；提供无障碍描述、悬停 Tooltip 与空格详情浮层。
 card_motion.go: 身份卡悬停 3D 倾斜与内层视差（5.5° 上限、透视距离为卡宽 2.5 倍、内容 1.5pt / 徽标 2pt、可打断弹簧跟随、离开归中）；倾斜开关与减少动态效果都由调用方传入，关掉时走与 ReduceMotion 相同的归零通路，不另写几何；只输出旋转与视差变换，不含缩放——放大与让位统一由 hover_layout.go 分配给整个画廊，这里再叠缩放会双重放大；不写选择、不改布局。
 view_style.go: 原生磨砂上的地址卡与卡片薄层、细边界、卡片投影与轻量反馈，保持文字对比；高对比或降低透明度时改用不透明表面并去掉投影；根背景与地址卡的覆盖 alpha 由入参决定（缺省值来自 settings.go 的默认外观）、常态/选中卡的次行文字色都在这里定义。
 card_glow.go: 选中身份卡的流彩描边与外辉光的参数与预合成——Stripe 的 5 stop 位置、BorderBeam 的 6s 周期与 1pt 线宽及暖/紫两色（首尾同色以保证转圈接缝连续）、Pow 的内两级单色阴影公式（base radius 19 与 gain 0.62 均为按真机像素调出的适配值，非 Pow 默认 16 / 1；派生半径 3.325 / 6.650pt，依据是选中卡底边外 2–5px 与未选中同像素相差浅色 27/20/13/9、深色 20/14/10/5 级，邻卡 0–1 级）。stops 与基础选中边框按 source-over 预合成，缓存经 `ui.Local` 归属当前卡片、以 accent 为键，因此有状态但不跨卡片/窗口共享；逐帧只改渐变起始角，由共享静态 Keyframes 调度，无逐帧分配、无 shader、无贴图。
-ui_test.go: 混合输入、九身份同屏、末行边界和窄屏导航回归，防止静止悬停覆盖键盘选择；设置面板的入口（header 设置图标 / ⌘,）、Esc 分层、面板期间数字键与回车不启动身份、Tab + 方向键调值、恢复默认、固定高度、外观三项在无材质/降低透明度下置灰、流彩关闭后动画帧收敛与静态边框仍在、倾斜与悬停关闭后几何停在静止槽位、强制减少动态效果与系统一致。
+ui_test.go: 混合输入、九身份同屏、末行边界和窄屏导航回归，防止静止悬停覆盖键盘选择；设置面板的入口（header 设置图标 / ⌘,）、Esc 分层、面板期间数字键与回车不启动身份、Tab + 方向键调值、恢复默认、固定高度、外观三项在无材质/降低透明度下置灰、流彩关闭后动画帧收敛与静态边框仍在、倾斜与悬停关闭后几何停在静止槽位、强制减少动态效果与系统一致；启动反馈的回归：点击后同一帧进入 launching、地址卡与选中身份卡两处加载文案都用强调色（像素断言，opaque 与 ReduceMotion 也覆盖）、指示器是真的画出来的强调色像素而不只是无障碍 Label、ReduceMotion 下静态表达且推进时钟后像素不变、点击非选中卡时选择与被交付卡一致且旧选中卡没有加载强调、`CPR_DUMP_LOADING_FRAME=1` 时把四档 launching 帧写成 PNG、启动中重复点击不重复交付、失败回到既有错误并可原地重试、出场帧继续显示交付地址与「已交给 Chrome」而不回落默认主页、ReduceMotion 下 loading 不请求动画帧、启动中 Esc 仍立即退出。
 card_motion_test.go: 倾斜方向与钳制、ReduceMotion 归零、槽位几何不变、真实 3D 变换、网格顺序与列数、内容不越界、跨卡片宽度强度一致。
 hover_layout_test.go: 网格同排与单列整列两种带状、悬停卡放大到 1.06/1.08、邻居按距离权重缩窄、带首尾外边界与间距守恒、卡片互不重叠、边缘卡单侧锚定、交叉轴受间距/内缩约束、ReduceMotion 与未就绪布局返回单位变换。
 hover_ui_test.go: 放大后命中区域跟随可见卡（首列 grownRight−2 必须落在邻居静止槽位内仍归本卡）、点击放大边缘只启动该卡一次、静止指针不伪造 hover 切换、离开后几何复原、悬停不改变窗口尺寸/列数/身份顺序。
@@ -62,6 +62,7 @@ mygo.json: Bundle 标识、URL scheme、文档类型、Linux 打包意图和版�
 - `mygo.App.OnOpenURL` / `OnOpenFile` 统一入队；不再手动遍历启动参数，避免重复请求。
 - `openWith` 持锁时只调用 `targetLocked` / `currentLocked`；Chrome 启动在后台运行，结果经 Window.Update 回到主线程。
 - Esc 分层：设置面板打开时 Esc 只关闭面板并回到身份列表，面板已关时才退出应用；关闭按钮、⌘Q 与系统退出不受队列或动效拦截。除此之外 Esc 永远有效（启动中、错误、空状态下都能用），装饰性动效不能延迟键盘选择与链接交付。
+- 启动反馈：选中身份后 `beginLaunch` 在同一帧写入 launching 并重绘，地址卡次行与真正被交付的那张身份卡的副行同时显示 `launchingNote` 并改用强调色（不新增表面、不改几何；选中卡不得被 `textOnChosen` 覆盖，opaque 表面同样成立）；地址卡次行的指示器 13pt（12–14pt 是 15pt 次行能容纳的档位），ReduceMotion 下换成静态强调色描边圆环（不自调度、不调 Keyframes）；点击某张卡时选择必须与该卡一致，loading 只画在真正被交付的卡上；成功交付至少保持 `launchMinFeedback`(500ms) 的可见 loading（只在后台 goroutine 里推迟状态回写，不阻塞界面、不等待浏览器生命周期、失败不补时长）；出场帧继续显示真正交付的地址并写「已交给 Chrome」，绝不回落成「未收到外部链接 · 默认打开主页」，也不宣称页面已打开；loading 不得成为空转动画（ReduceMotion 下没有任何自调度重绘）。
 - 设置入口就是 header 设置图标（滑杆）+ 视图内 ⌘,：不得新增独立设置窗口、不得加菜单栏常驻入口、不得改 `Panel` 语义。面板窗口不激活应用、没有菜单栏，标准 ⌘, 与 ⌘Q 都收不到，所以两者都必须在视图内接管。
 - 设置面板替换身份列表区，地址卡保留（当前链接与剩余条数仍在，也是「阅读面浓度」的预览对象）；面板高度用 layout.go 的固定常量 `panelSettingsHeight`，不随身份数量变化，关闭后窗口回到原来的列表高度。面板打开时 `snap.chosen`、滚动位置、列数与身份顺序一律不变，关闭后选中卡照旧可见。
 - 设置面板打开时数字键 1–9、回车、⌘C 与方向键都不得启动身份、复制或改写列表选择（避免误交付链接）；新链接照常入队并在地址卡显示剩余条数。

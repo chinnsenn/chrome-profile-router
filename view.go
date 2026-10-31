@@ -1,5 +1,5 @@
 // [INPUT]: 依赖 selectorApp 队列/启动状态、MyGo ui 包、view_style.go 调色板、settings.go 的外观设置、motion.go 内容生命周期，以及 layout.go 布局常量。
-// [OUTPUT]: 渲染 header 与身份画廊，把指针与键盘意图转成选择、启动与退出；header 右侧提供设置入口（自绘滑杆图标 + 视图内快捷键），设置面板替换身份列表区，地址卡由 destination.go 渲染、面板控件在 settings_panel.go。
+// [OUTPUT]: 渲染 header 与身份画廊，把指针与键盘意图转成选择、启动与退出；header 右侧提供设置入口（自绘滑杆图标 + 视图内快捷键），设置面板替换身份列表区，地址卡由 destination.go 渲染、面板控件在 settings_panel.go；snapshot 另外携带出场相位与最近交付地址（exiting/delivered），供地址卡在出场帧显示诚实文案。
 // [POS]: 根包的视图层主入口；身份项渲染委托给 profile_view.go，路由与队列逻辑仍在 main.go。
 // [PROTOCOL]: 变更时更新此头部，然后检查 AGENTS.md
 package main
@@ -30,6 +30,11 @@ type snapshot struct {
 	motion motionSettings
 	// settingsOpen 表示本帧画的是设置面板而不是身份列表。
 	settingsOpen bool
+	// exiting 表示本帧处于自然出场（交付成功后的淡出）。它只影响地址卡
+	// 的文案：此时队列已空，但地址卡必须继续显示真正交付的地址。
+	exiting bool
+	// delivered 是最近一次成功交付的地址，仅在与 exiting 同时成立时使用。
+	delivered string
 }
 
 // reduceMotion 报告本帧是否按"减少动态效果"渲染：系统偏好与设置里的
@@ -164,6 +169,8 @@ func (a *selectorApp) snapshot() snapshot {
 		appearance:         a.settings.Appearance.normalized(),
 		motion:             a.settings.Motion.normalized(),
 		settingsOpen:       a.settingsOpen,
+		exiting:            a.motion.phase == exitNatural,
+		delivered:          a.motion.delivered,
 	}
 	// revealChosen 是"下一帧把选中项滚进视野"的一次性标记，只有真正画列表
 	// 的帧才消费它：设置面板打开时列表没画，标记必须留着，否则关闭面板后

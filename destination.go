@@ -1,5 +1,5 @@
 // [INPUT]: 依赖 selectorApp 的目标地址与队列状态、view_style.go 的调色板、shortcut_<goos>.go 的快捷键文案，以及 mygo 的剪贴板。
-// [OUTPUT]: 渲染整幅宽度的地址卡（域名主行、路径/启动状态/失败原因次行、队列剩余徽标、复制按钮），并把按钮与快捷键的复制动作交给系统剪贴板。
+// [OUTPUT]: 渲染整幅宽度的地址卡（域名主行、路径/启动状态/失败原因次行、队列剩余徽标、复制按钮），并把按钮与快捷键的复制动作交给系统剪贴板；启动中的文案与选中身份卡共用 launchingNote，spinner 在减少动态效果下不画（它自调度重绘），出场帧显示真正交付的地址与「已交给 Chrome」而不回落默认主页。
 // [POS]: 面板顶部的目标区；复制走 MyGo 的跨平台剪贴板，不再依赖平台外部命令。
 // [PROTOCOL]: 变更时更新此头部，然后检查 AGENTS.md
 package main
@@ -14,6 +14,16 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
+// launchingNote 是启动中唯一的文案：地址卡次行与选中身份卡的副行共用它，
+// 界面不会对同一件事说出两种说法。
+const launchingNote = "正在启动 Chrome…"
+
+// loadingIndicatorLabel 是启动指示器的无障碍名。它与可见文案刻意不同：
+// 无障碍树里"正在启动 Chrome…"只属于那两处真实文本节点，回归测试因此能
+// 精确计数，不会被指示器的 Label 污染（旧断言只数"含文案的条目 ≥2"，
+// 删掉指示器也照样通过）。
+const loadingIndicatorLabel = "正在启动"
+
 // destination 是面板的视觉重点：一张整幅宽度的地址卡，域名以 24pt 粗体
 // 独占主行，路径、启动状态或失败原因写在独立的次行，队列剩余条数做成贴在
 // 主行右侧的小徽标。
@@ -23,6 +33,13 @@ import (
 // 地址文字区域可拖动窗口，悬停给出完整 URL；右侧按钮或快捷键复制原始地址。
 func (a *selectorApp) destination(c *ui.Context, pal palette, snap snapshot) {
 	full := a.targetURLForDisplay()
+	// 本帧生效的减少动态效果：系统偏好与设置里的「强制开启」取并集。
+	reduce := snap.reduceMotion(c.Preferences().ReduceMotion)
+	// 出场帧：队列已经出队，但地址卡必须继续显示真正交付的地址，绝不回落
+	// 成默认主页的文案。
+	if snap.exiting && snap.delivered != "" {
+		full = snap.delivered
+	}
 	host, pathStr, _ := parseURLDetails(full)
 	// 是否收到外部请求由队列本身判断，绝不与 HomeURL 做字符串比较。
 	hasPending := a.hasPendingRequests()
@@ -70,7 +87,15 @@ func (a *selectorApp) destination(c *ui.Context, pal palette, snap snapshot) {
 		noteColor = pal.danger
 		noteTip = snap.launchError + "；请重试，或确认 Chrome 已安装。"
 	case snap.launching:
-		note = "正在启动 Chrome…"
+		note = launchingNote
+		// 启动中不是"又一条普通路径"：它与指示器同色，字号与行高不变，
+		// 因此状态在颜色上就能读出来，而不是只换了一句话。
+		noteColor = pal.accent
+	case snap.exiting && snap.delivered != "":
+		// 交付已经成功，但页面是否打开不在本应用可观测范围内：只陈述
+		// "已交给 Chrome"，绝不在出场帧里回落成「未收到外部链接 · 默认
+		// 打开主页」——那与刚刚发生的事正好相反。
+		note = "已交给 Chrome"
 	case secondLine != "" && secondLine != "/":
 		note = secondLine
 	case hasPending:
@@ -166,7 +191,7 @@ func (a *selectorApp) destination(c *ui.Context, pal palette, snap snapshot) {
 			Shrink(0).
 			Children(func() {
 				if snap.launching && snap.launchError == "" {
-					ui.Spinner(c).Size(10, 10).TextColor(pal.accent).Shrink(0)
+					loadingIndicator(c, pal, reduce)
 				}
 				line := ui.Text(c, note).
 					FontSize(12.5).
@@ -180,4 +205,35 @@ func (a *selectorApp) destination(c *ui.Context, pal palette, snap snapshot) {
 				}
 			})
 	})
+}
+
+// loadingIndicatorSize 是启动指示器的边长。次行固定 15pt，12–14pt 是这一行
+// 能容纳的档位；13pt 让 Spinner 的笔画（0.09W）到 1.17pt、外径 5.98pt，在
+// 地址卡上真正看得见，而 13 < 15 既不撑高次行，也不改变 72pt 的卡片高度。
+const loadingIndicatorSize float32 = 13
+
+// loadingIndicator 画启动中的指示器。两种形态共用同一个无障碍名
+// （loadingIndicatorLabel），所以无障碍树里不会多出一份可见文案。
+//
+//   - 常态：MyGo 的 Spinner（12 根辐条、每 75ms 一格），用 Painter.After
+//     自调度重绘。
+//   - 减少动态效果：静态强调色描边圆环。它不自调度、不调 Keyframes，因此
+//     不会留下空转的动画帧；但"启动中"仍有形状 + 强调色的可见表达，不会
+//     退化成"只换了一句话"。
+func loadingIndicator(c *ui.Context, pal palette, reduce bool) {
+	if reduce {
+		ui.Box(c).
+			Size(loadingIndicatorSize, loadingIndicatorSize).
+			Radius(loadingIndicatorSize/2).
+			Border(1.5, pal.accent).
+			Shrink(0).
+			Role(ui.RoleProgress).
+			Label(loadingIndicatorLabel)
+		return
+	}
+	ui.Spinner(c).
+		Size(loadingIndicatorSize, loadingIndicatorSize).
+		TextColor(pal.accent).
+		Label(loadingIndicatorLabel).
+		Shrink(0)
 }

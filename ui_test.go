@@ -1,12 +1,17 @@
 // [INPUT]: 依赖 MyGo 离屏视图输入、selectorApp 的真实选择状态、settings.go 的默认设置与 layout.go 的设置面板预算。
-// [OUTPUT]: 保护混合输入、九身份同屏、网格边界与窄屏导航，以及设置面板的入口、Esc 分层、面板期间的键盘屏蔽、滑块/开关/恢复默认的真实写入、固定高度与动效开关的收敛行为。
+// [OUTPUT]: 保护混合输入、九身份同屏、网格边界与窄屏导航，以及设置面板的入口、Esc 分层、面板期间的键盘屏蔽、滑块/开关/恢复默认的真实写入、固定高度与动效开关的收敛行为；启动反馈用像素与精确文本断言约束（地址卡与选中卡副行都是强调色、指示器是画出来的强调色像素而不是只有无障碍 Label、ReduceMotion 下静态表达且推进时钟后像素不变、点击非选中卡时选择与被交付卡一致），并在 CPR_DUMP_LOADING_FRAME=1 时把四档 launching 帧写成 PNG。
 // [POS]: 根包的交互回归入口，不启动 Chrome 或改写用户配置（设置写入一律走临时目录或内存）。
 // [PROTOCOL]: 变更时更新此头部，然后检查 AGENTS.md
 package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"image"
+	"image/png"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -470,5 +475,403 @@ func TestForcedReduceMotionMatchesSystemReduce(t *testing.T) {
 	sysView.Advance(time.Second)
 	if sysView.FramePending() {
 		t.Fatal("系统 ReduceMotion 下仍在请求动画帧")
+	}
+}
+
+// ============================================================================
+// 启动中的可见反馈
+// ============================================================================
+
+// accentPixelThreshold 判定"这个像素被强调色染过"：强调色（深色 #4C9AFF、
+// 浅色 #2563EB）的蓝比红高 179–198 级，而两档文字色（≤17 级）、选中卡薄底
+// （≤32 级）与地址卡底（≤11 级）都远低于它，阈值取在中间。
+const accentPixelThreshold = 60
+
+// accentPixels 数出矩形里被强调色染过的像素。它只对**真的画出来的**像素
+// 成立：无障碍 Label 不进图像，所以"指示器只剩一个 Label"的假绿在这里
+// 必然失败。
+func accentPixels(img *image.RGBA, r ui.Rect) int {
+	b := img.Bounds()
+	count := 0
+	for y := max(b.Min.Y, int(r.Y)); y < min(b.Max.Y, int(r.Y+r.H)); y++ {
+		for x := max(b.Min.X, int(r.X)); x < min(b.Max.X, int(r.X+r.W)); x++ {
+			px := img.RGBAAt(x, y)
+			if int(px.B)-int(px.R) >= accentPixelThreshold {
+				count++
+			}
+		}
+	}
+	return count
+}
+
+// sameRow 判定两个矩形在同一条次行上：y 与行高一致（宽度随文字内容不同，
+// 因此不比）。
+func sameRow(a, b ui.Rect) bool {
+	return absf(a.Y-b.Y) <= 1 && absf(a.H-b.H) <= 1
+}
+
+// dumpLoadingFrame 在 CPR_DUMP_LOADING_FRAME=1 时把真实渲染帧写成 PNG 供
+// 人工核验；未设置时不写盘、不产生任何文件。图片来自 viewWith 的真实渲染
+// （Tester.Image()），不是手工绘制。
+func dumpLoadingFrame(t *testing.T, view *ui.Tester, name string) {
+	t.Helper()
+	if os.Getenv("CPR_DUMP_LOADING_FRAME") != "1" {
+		return
+	}
+	const dir = "/tmp/cpr-loading-frames"
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("创建 %s 失败: %v", dir, err)
+	}
+	path := filepath.Join(dir, name+".png")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("创建 %s 失败: %v", path, err)
+	}
+	defer f.Close()
+	if err := png.Encode(f, view.Image()); err != nil {
+		t.Fatalf("写 %s 失败: %v", path, err)
+	}
+	t.Logf("loading 帧已写出: %s", path)
+}
+
+// TestLaunchingFeedbackIsVisibleAndHonest 约束"选中身份到 Chrome 打开之间"
+// 的可见反馈：启动状态与选中同帧写入，地址卡次行与选中身份卡副行都立刻
+// 显示加载文案**并改用强调色**（像素断言，不是只数文本条目）；启动中不
+// 重复交付，失败回到既有错误并允许原地重试；成功交付后按原队列语义出队，
+// 出场帧继续显示真正交付的地址与「已交给 Chrome」，绝不回落默认主页；
+// 减少动态效果下 loading 只留静态表达，不请求动画帧。
+func TestLaunchingFeedbackIsVisibleAndHonest(t *testing.T) {
+	const target = "https://example.test/loading"
+	quits := 0
+	app := settingsApp(func() { quits++ })
+	app.enqueue(request{Kind: requestURL, Value: target})
+	var launches int
+	var delivered uint64
+	view := ui.NewTester(func(c *ui.Context) {
+		app.viewWith(c, func(p Profile) {
+			launches++
+			_, delivered, _ = app.beginLaunch()
+		})
+	}, 660, 420)
+	view.SetVibrancy(true)
+	view.Advance(time.Second)
+	// 启动前记下选中卡副行的位置：启动中它换成了加载文案，而布局不变，
+	// 这个盒子仍是同一行，用作强调色的取样区域。
+	restSub, ok := view.Find("account1@example.com")
+	if !ok {
+		t.Fatal("启动前没有画出选中卡的副行")
+	}
+
+	if err := view.Click("Identity 1"); err != nil {
+		t.Fatal(err)
+	}
+	if launches != 1 {
+		t.Fatalf("点击选中卡没有发起启动: %d", launches)
+	}
+	if !app.snapshot().launching {
+		t.Fatal("选中身份后没有在同一帧进入启动状态")
+	}
+	// 两处文案必须是两个**真的画出来的文本节点**：地址卡次行与选中身份卡
+	// 副行。这里按精确匹配计数——指示器的无障碍 Label 用另一个名字
+	// （loadingIndicatorLabel），因此不像旧的"含 launchingNote 的条目 ≥2"
+	// 那样被 Label 污染。
+	notes := 0
+	for _, s := range view.Texts() {
+		if s == launchingNote {
+			notes++
+		}
+	}
+	if notes != 2 {
+		t.Fatalf("启动中应当只有地址卡与选中身份卡两处加载文案，实际 %d 处: %v", notes, view.Texts())
+	}
+	noteBox, ok := view.Find(launchingNote)
+	if !ok {
+		t.Fatalf("地址卡的加载文案没有画出来: %v", view.Texts())
+	}
+	cardBox, ok := view.Find("Identity 1")
+	if !ok {
+		t.Fatal("选中身份卡没有画出来")
+	}
+	if noteBox.Y+noteBox.H > cardBox.Y {
+		t.Fatalf("第一处加载文案不在地址卡里: note=%+v card=%+v", noteBox, cardBox)
+	}
+	// 地址卡次行与选中卡副行都必须是强调色：与常态同色同字号的小字不算
+	// "启动中"这个状态。选中卡的副行取样区域用启动前同一张卡的邮箱行
+	// （布局不变，位置仍有效）。
+	img := view.Image()
+	if n := accentPixels(img, noteBox); n < 20 {
+		t.Fatalf("地址卡的加载文案没有用强调色画出来（强调像素 %d）", n)
+	}
+	if n := accentPixels(img, restSub); n < 20 {
+		t.Fatalf("选中卡的加载副行没有强调色（强调像素 %d，取样 %+v）", n, restSub)
+	}
+	// 启动中重复点击不得再次交付。
+	if err := view.Click("Identity 2"); err != nil {
+		t.Fatal(err)
+	}
+	if launches != 1 {
+		t.Fatalf("启动中重复点击又发起了一次启动: %d", launches)
+	}
+
+	// 失败：收起 loading、显示既有错误，并允许原地重试。
+	app.completeLaunch(target, delivered, errors.New("boom"))
+	view.Frame()
+	if app.snapshot().launching {
+		t.Fatal("失败后仍停在加载状态")
+	}
+	if !view.HasText("启动失败：") {
+		t.Fatalf("失败后没有显示既有错误: %v", view.Texts())
+	}
+	if err := view.Click("Identity 1"); err != nil {
+		t.Fatal(err)
+	}
+	if launches != 2 {
+		t.Fatalf("失败后不能原地重试: %d", launches)
+	}
+
+	// 成功：按原队列语义出队，出场帧继续显示真正交付的地址与诚实文案。
+	app.completeLaunch(target, delivered, nil)
+	view.Frame()
+	if app.pendingCount() != 0 {
+		t.Fatalf("成功交付后请求没有出队: %d", app.pendingCount())
+	}
+	if view.HasText("google.com") {
+		t.Fatalf("出场帧回落成默认主页的地址: %v", view.Texts())
+	}
+	if !view.HasText("example.test") {
+		t.Fatalf("出场帧没有继续显示真正交付的地址: %v", view.Texts())
+	}
+	if !view.HasText("已交给 Chrome") {
+		t.Fatalf("出场帧没有给出诚实的交付文案: %v", view.Texts())
+	}
+	view.Advance(time.Second)
+	if quits != 1 {
+		t.Fatalf("成功交付后没有按原出场语义退出: quits=%d", quits)
+	}
+
+	// 减少动态效果：loading 只留静态文案，不请求动画帧。
+	reduced := settingsApp(nil)
+	reduced.settings.Motion.ReduceMotion = motionReduceOn
+	reduced.enqueue(request{Kind: requestURL, Value: target})
+	reducedView := ui.NewTester(func(c *ui.Context) {
+		reduced.viewWith(c, func(p Profile) { reduced.beginLaunch() })
+	}, 660, 420)
+	reducedView.SetVibrancy(true)
+	reducedView.Advance(time.Second)
+	if err := reducedView.Click("Identity 1"); err != nil {
+		t.Fatal(err)
+	}
+	reducedView.Advance(time.Second)
+	if !reducedView.HasText(launchingNote) {
+		t.Fatalf("减少动态效果下没有加载文案: %v", reducedView.Texts())
+	}
+	if reducedView.FramePending() {
+		t.Fatal("减少动态效果下 loading 仍在请求动画帧")
+	}
+}
+
+// TestLaunchingIndicatorIsPainted 断言"启动中"的指示器是**画出来的像素**，
+// 而不是只有一个无障碍 Label：深色、浅色、深色 + 减少动态效果、深色 +
+// 不透明表面四档都要求指示器盒内存在强调色像素，且指示器与次行都不改变
+// 布局（次行仍 15pt、卡片盒子不动）。
+//
+// 减少动态效果那一档额外要求 FramePending()==false 且推进时钟后像素不变：
+// 静态描边既不自调度重绘，也不留下逐帧变化的动画。不透明那一档反过来要求
+// 推进时钟后画面确实变了（那里没有流彩，唯一的动画源就是 Spinner），
+// 证明动画档用的是真正自调度的 Spinner，而不是静态占位。
+func TestLaunchingIndicatorIsPainted(t *testing.T) {
+	cases := []struct {
+		name     string
+		dark     bool
+		vibrancy bool
+		reduce   bool
+	}{
+		{name: "dark", dark: true, vibrancy: true},
+		{name: "light", dark: false, vibrancy: true},
+		{name: "dark-reduce-motion", dark: true, vibrancy: true, reduce: true},
+		{name: "dark-opaque", dark: true, vibrancy: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			app := settingsApp(nil)
+			app.enqueue(request{Kind: requestURL, Value: "https://example.test/loading"})
+			if tc.dark {
+				app.themeMode = ThemeDark
+			}
+			if tc.reduce {
+				app.settings.Motion.ReduceMotion = motionReduceOn
+			}
+			view := ui.NewTester(func(c *ui.Context) {
+				app.viewWith(c, func(p Profile) { app.beginLaunch() })
+			}, 660, 420)
+			if tc.vibrancy {
+				view.SetVibrancy(true)
+			}
+			view.Advance(time.Second)
+
+			restCard := mustFindRect(t, view, "Identity 1")
+			restSub := mustFindRect(t, view, "account1@example.com")
+			restNote := mustFindRect(t, view, "/loading")
+
+			if err := view.Click("Identity 1"); err != nil {
+				t.Fatal(err)
+			}
+			// 指针离开列表：几何比较不能被悬停放大污染（选择不受影响）。
+			view.Move(0, 0)
+			view.Advance(time.Second)
+			if !app.snapshot().launching {
+				t.Fatal("点击后没有进入启动状态")
+			}
+			dumpLoadingFrame(t, view, tc.name)
+
+			indicator, ok := view.Find(loadingIndicatorLabel)
+			if !ok {
+				t.Fatalf("启动中没有画指示器（只有文案不算）: %v", view.Texts())
+			}
+			// 12–15pt：次行高 15pt，指示器必须明显可见且不得撑高这一行。
+			if indicator.W < 12 || indicator.W > 15 || indicator.H < 12 || indicator.H > 15 {
+				t.Fatalf("指示器尺寸 %+v 不在次行能容纳且明显可见的档位（12–15pt）", indicator)
+			}
+			if n := accentPixels(view.Image(), indicator); n < 12 {
+				t.Fatalf("指示器只有无障碍 Label，没有真的画出强调色像素（%d）: %+v", n, indicator)
+			}
+
+			// 布局不变：地址卡次行仍是 15pt，选中卡盒子与启动前一致。
+			note := mustFindRect(t, view, launchingNote)
+			if absf(note.H-15) > 0.5 {
+				t.Fatalf("地址卡次行高度被改变了: %+v", note)
+			}
+			if !sameRow(note, restNote) {
+				t.Fatalf("加载文案换了行: note=%+v rest=%+v", note, restNote)
+			}
+			if card := mustFindRect(t, view, "Identity 1"); !nearlySameRect(card, restCard) {
+				t.Fatalf("启动状态改变了卡片几何: card=%+v rest=%+v", card, restCard)
+			}
+			// 选中卡的加载副行在四档外观下都是强调色：opaque 表面（高对比/
+			// 降低透明度/无材质）不能退回与常态同色的小字。
+			if n := accentPixels(view.Image(), restSub); n < 20 {
+				t.Fatalf("选中卡的加载副行没有强调色（强调像素 %d，取样 %+v）", n, restSub)
+			}
+			before := append([]byte(nil), view.Image().Pix...)
+			if tc.reduce {
+				if view.FramePending() {
+					t.Fatal("减少动态效果下 loading 仍在请求动画帧（静态描边不得自调度）")
+				}
+				view.Advance(300 * time.Millisecond)
+				if !bytes.Equal(before, view.Image().Pix) {
+					t.Fatal("减少动态效果下 loading 仍在逐帧变化，静态表达变成了空转动画")
+				}
+			} else if !tc.vibrancy {
+				// 不透明表面没有流彩，唯一的动画源就是 Spinner 自己。
+				view.Advance(100 * time.Millisecond)
+				if bytes.Equal(before, view.Image().Pix) {
+					t.Fatal("动画档的 Spinner 没有自调度重绘，说明画的是静态占位")
+				}
+			}
+		})
+	}
+}
+
+// TestClickingUnchosenCardLaunchesThatCard 约束"交付哪张卡"与"选中哪张卡"
+// 必须一致：指针静止在第二张卡上、键盘把选择移回第一张，再点第二张时，
+// 交付的是第二张，选择也必须跟着它；加载强调只能画在真正被交付的那张卡
+// 上，旧的选中卡不得同时显示加载状态。
+func TestClickingUnchosenCardLaunchesThatCard(t *testing.T) {
+	app := settingsApp(nil)
+	app.enqueue(request{Kind: requestURL, Value: "https://example.test/loading"})
+	var launched []string
+	view := ui.NewTester(func(c *ui.Context) {
+		app.viewWith(c, func(p Profile) {
+			launched = append(launched, p.Name)
+			app.beginLaunch()
+		})
+	}, 660, 420)
+	// 无材质（不透明表面）：本用例断言的是"点击哪张卡"的选择语义，不需要
+	// 磨砂上的柔光/流彩；磨砂表面下的强调色由 TestLaunchingIndicatorIsPainted
+	// 覆盖。
+	view.Advance(time.Second)
+	// 指针在列表外时记下两张卡副行的位置（静止槽位几何）：启动只换文字，
+	// 行位置不变，因此这两个盒子在加载帧里仍是同一行。
+	oldSub := mustFindRect(t, view, "account1@example.com")
+	deliveredSub := mustFindRect(t, view, "account2@example.com")
+
+	// 指针先落在第一张卡上（第一帧只登记悬停矩形），再移到第二张：第二次
+	// 移动落到"与上一帧不同的一行"，选择因此跟着指针到第二张。
+	first := mustFindRect(t, view, "Identity 1")
+	second := mustFindRect(t, view, "Identity 2")
+	cx, cy := second.X+second.W/2, second.Y+second.H/2
+	view.Move(first.X+first.W/2, first.Y+first.H/2)
+	view.Move(cx, cy)
+	view.Advance(time.Second)
+	if app.chosen != 1 {
+		t.Fatalf("指针真实移动没有选中第二张卡: chosen=%d", app.chosen)
+	}
+	grown := mustFindRect(t, view, "Identity 2")
+	if cx < grown.X || cx > grown.X+grown.W || cy < grown.Y || cy > grown.Y+grown.H {
+		t.Fatalf("指针停下的位置不在放大后的第二张卡里: grown=%+v", grown)
+	}
+
+	// 键盘把选择移回第一张；指针保持静止，不能把选择拽回去。
+	view.Key(0, ui.KeyLeft)
+	view.Advance(time.Second)
+	if app.chosen != 0 {
+		t.Fatalf("键盘没有把选择移回第一张: chosen=%d", app.chosen)
+	}
+
+	// 指针一动不动地点击第二张卡：交付第二张，选择必须跟着它。
+	view.ClickAt(cx, cy)
+	// 指针离开列表：加载期间不再有悬停放大，几何回到静止槽位，上面的取样
+	// 区域仍然有效；选择在启动中受守卫，不会因为指针移开而改变。
+	view.Move(0, 0)
+	view.Advance(time.Second)
+
+	if len(launched) != 1 || launched[0] != "Identity 2" {
+		t.Fatalf("点击第二张卡应当交付第二张，实际: %v", launched)
+	}
+	if !app.snapshot().launching {
+		t.Fatal("点击后没有进入启动状态")
+	}
+	// 加载强调必须落在被交付的那张卡上：它的副行是强调色的加载文案，旧的
+	// 选中卡只剩普通邮箱色。两条都是像素断言——无障碍 Label 进不了图像，
+	// 因此"只画了文字节点"的假绿在这里不成立。
+	img := view.Image()
+	if n := accentPixels(img, deliveredSub); n < 20 {
+		t.Fatalf("被交付的卡没有画出加载强调（强调像素 %d，区域 %+v）", n, deliveredSub)
+	}
+	if n := accentPixels(img, oldSub); n != 0 {
+		t.Fatalf("旧的选中卡仍在画加载强调（强调像素 %d，区域 %+v）", n, oldSub)
+	}
+	if app.chosen != 1 {
+		t.Fatalf("交付的是第二张卡，选中项却停在 %d（loading 会画错卡）", app.chosen)
+	}
+	notes := 0
+	for _, s := range view.Texts() {
+		if s == launchingNote {
+			notes++
+		}
+	}
+	if notes != 2 {
+		t.Fatalf("启动中应当只有地址卡与被交付卡两处加载文案，实际 %d 处: %v", notes, view.Texts())
+	}
+}
+
+// TestEscapeQuitsWhileLaunching 约束装饰性 loading 不拦键盘：启动中 Esc
+// 仍然立即退出，与既有优先级一致。
+func TestEscapeQuitsWhileLaunching(t *testing.T) {
+	quits := 0
+	app := settingsApp(func() { quits++ })
+	view := ui.NewTester(func(c *ui.Context) {
+		app.viewWith(c, func(p Profile) { app.beginLaunch() })
+	}, 660, 420)
+	view.Advance(time.Second)
+	if err := view.Click("Identity 1"); err != nil {
+		t.Fatal(err)
+	}
+	if !app.snapshot().launching {
+		t.Fatal("点击后没有进入启动状态")
+	}
+	view.Key(0, ui.KeyEscape)
+	if quits != 1 {
+		t.Fatalf("启动中 Esc 没有立即退出: quits=%d", quits)
 	}
 }

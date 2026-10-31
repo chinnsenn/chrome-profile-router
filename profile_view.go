@@ -1,5 +1,5 @@
 // [INPUT]: 依赖 selectorApp 的状态快照、ui 包与 view_style.go 的调色板；卡片高度、间距、头像与徽标尺寸来自 layout.go；悬停倾斜与内层视差来自 card_motion.go 的 cardTilt；悬停放大与邻居让位的几何来自 hover_layout.go 的 hoverLayout；选中卡的流彩描边与柔光参数来自 card_glow.go。
-// [OUTPUT]: 渲染身份卡片画廊——1–4 个身份的 56pt 单列卡与 5+ 的 60pt 网格卡（身份色细条、32pt 真实头像、13.5pt 名称、11.5pt 邮箱、数字键徽标）。每张卡拆成三层：slot 是稳定布局盒，承载 Height / Shrink / FillWidth / ScrollIntoView，从不加变换；layer 是交互层，承载 Key / 命中 / Cursor / Role / Label / Description / Tooltip / Hovered / Pressed / Clicked 与悬停放大、邻居让位、按压弹簧，因命中测试会逆变换指针，放大出来的边缘同样可点；surface 是可见表面，承载 Padding / Gap / Radius / Border / Background / Shadow 与全部内容，并接受悬停 3D 倾斜与内层视差。选中且非不透明回退时，surface 的 1pt 描边换成预合成的锥形流彩、并叠加两级同色柔光。另提供无障碍描述、悬停 Tooltip 与空格详情浮层。
+// [OUTPUT]: 渲染身份卡片画廊——1–4 个身份的 56pt 单列卡与 5+ 的 60pt 网格卡（身份色细条、32pt 真实头像、13.5pt 名称、11.5pt 邮箱、数字键徽标）；启动中真正被交付的那张卡把副行换成与地址卡相同的 launchingNote（静态文字，不加动画），于是选中到 Chrome 打开之间有两处可见反馈。每张卡拆成三层：slot 是稳定布局盒，承载 Height / Shrink / FillWidth / ScrollIntoView，从不加变换；layer 是交互层，承载 Key / 命中 / Cursor / Role / Label / Description / Tooltip / Hovered / Pressed / Clicked 与悬停放大、邻居让位、按压弹簧，因命中测试会逆变换指针，放大出来的边缘同样可点；surface 是可见表面，承载 Padding / Gap / Radius / Border / Background / Shadow 与全部内容，并接受悬停 3D 倾斜与内层视差。选中且非不透明回退时，surface 的 1pt 描边换成预合成的锥形流彩、并叠加两级同色柔光。另提供无障碍描述、悬停 Tooltip 与空格详情浮层。
 // [POS]: 根包的视图层分片，专管身份项呈现；状态写入与事件调度仍在 view.go，倾斜与视差的参数与变换链在 card_motion.go，空间再分配在 hover_layout.go。
 // [PROTOCOL]: 变更时更新此头部，然后检查 AGENTS.md
 package main
@@ -233,6 +233,14 @@ func profileDetail(c *ui.Context, pal palette, prof Profile, idx int, anchor ui.
 // 保留，选中标识不消失。snap.motion 决定三个装饰性动效各自的开关。
 func (a *selectorApp) profileItem(c *ui.Context, pal palette, snap snapshot, prof Profile, idx int, isChosen, canLaunch, hovered bool, launch func(Profile), height float32, reduce bool) (slot, layer ui.Element, pressed bool) {
 	sub := profileSubtitle(prof)
+	// 启动中：真正被交付的那张卡把副行换成加载文案，于是"选中到 Chrome
+	// 打开"之间不只有地址卡次行的一处反馈。文案与地址卡共用 launchingNote，
+	// 用强调色而不是选中卡的常态色（见下面的赋值顺序），静态文字，不引入
+	// 第二处动画。
+	launching := snap.launching && isChosen
+	if launching {
+		sub = launchingNote
+	}
 	fullTip := prof.Name
 	if sub != "" && sub != prof.Name {
 		fullTip = prof.Name + "\n" + sub
@@ -247,6 +255,13 @@ func (a *selectorApp) profileItem(c *ui.Context, pal palette, snap snapshot, pro
 		rowBorder = pal.accent.Alpha(chosenBaseBorderAlpha)
 		subColor = pal.textOnChosen
 		ringColor = pal.accent
+	}
+	// 启动中的强调必须压过选中色：选中卡的副行本来用 textOnChosen，若先写
+	// accent 再被上面的选中分支覆盖，加载状态就只剩一句换词，强调色成了
+	// 死代码。opaque 表面（高对比/降低透明度/无材质）与磨砂表面共用 accent，
+	// 因此这里不需要另一套颜色。
+	if launching {
+		subColor = pal.accent
 	}
 
 	// slot：纯布局盒，不画像素、不做变换。
@@ -384,6 +399,14 @@ func (a *selectorApp) profileItem(c *ui.Context, pal palette, snap snapshot, pro
 	})
 
 	if layer.Clicked() && canLaunch {
+		// 点击非选中卡：先把选择挪到真正被交付的这张卡，否则本次交付的
+		// loading 会画在旧的选中卡上——界面就在说假话。启动中重复交付由
+		// canLaunch 挡住，交付期间指针与键盘都不改选择，所以选中项与被交付
+		// 的卡在整个 loading 期间保持一致。
+		if !isChosen {
+			a.setChosen(idx)
+			c.Invalidate()
+		}
 		launch(prof)
 	}
 	return slot, layer, pressed
