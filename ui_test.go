@@ -1,5 +1,5 @@
 // [INPUT]: 依赖 MyGo 离屏视图输入、selectorApp 的真实选择状态、settings.go 的默认设置与 layout.go 的设置面板预算。
-// [OUTPUT]: 保护混合输入、九身份同屏、网格边界与窄屏导航，以及设置面板的入口、Esc 分层、面板期间的键盘屏蔽、滑块/开关/恢复默认的真实写入、固定高度与动效开关的收敛行为；启动反馈用像素与精确文本断言约束（地址卡与选中卡副行都是强调色、指示器是画出来的强调色像素而不是只有无障碍 Label、ReduceMotion 下静态表达且推进时钟后像素不变、点击非选中卡时选择与被交付卡一致），并在 CPR_DUMP_LOADING_FRAME=1 时把四档 launching 帧写成 PNG。
+// [OUTPUT]: 保护混合输入、九身份同屏、网格边界与窄屏导航，以及设置面板的入口、Esc 分层、面板期间的键盘屏蔽、滑块/开关/恢复默认的真实写入、固定高度与动效开关的收敛行为；启动反馈用像素与精确文本断言约束（地址卡与选中卡副行都是强调色——逐像素色相判据仅 macOS，Windows ClearType 次像素抗锯齿会污染它；跨平台事实由「被交付卡邮箱文本消失、launchingNote 恰好两处」承担；地址卡次行与启动前同高而不写死 15pt；指示器是画出来的强调色像素而不是只有无障碍 Label，形状判据全平台；ReduceMotion 下静态表达且推进时钟后像素不变；点击非选中卡时选择与被交付卡一致），并在 CPR_DUMP_LOADING_FRAME=1 时把四档 launching 帧写成 PNG。
 // [POS]: 根包的交互回归入口，不启动 Chrome 或改写用户配置（设置写入一律走临时目录或内存）。
 // [PROTOCOL]: 变更时更新此头部，然后检查 AGENTS.md
 package main
@@ -12,6 +12,7 @@ import (
 	"image/png"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -510,6 +511,21 @@ func sameRow(a, b ui.Rect) bool {
 	return absf(a.Y-b.Y) <= 1 && absf(a.H-b.H) <= 1
 }
 
+// countText 数出画面里恰好等于 s 的文本条目。指示器的无障碍 Label 与可见
+// 文案刻意不同（loadingIndicatorLabel ≠ launchingNote），所以这里能精确
+// 计数，不会被指示器污染。文本存在性与计数不依赖字体光栅化，三个平台
+// 同一判据；逐像素的色相判据只在 macOS 上成立（Windows 的 ClearType 次
+// 像素抗锯齿会给文字加彩色边缘）。
+func countText(view *ui.Tester, s string) int {
+	n := 0
+	for _, got := range view.Texts() {
+		if got == s {
+			n++
+		}
+	}
+	return n
+}
+
 // dumpLoadingFrame 在 CPR_DUMP_LOADING_FRAME=1 时把真实渲染帧写成 PNG 供
 // 人工核验；未设置时不写盘、不产生任何文件。图片来自 viewWith 的真实渲染
 // （Tester.Image()），不是手工绘制。
@@ -736,10 +752,13 @@ func TestLaunchingIndicatorIsPainted(t *testing.T) {
 				t.Fatalf("指示器只有无障碍 Label，没有真的画出强调色像素（%d）: %+v", n, indicator)
 			}
 
-			// 布局不变：地址卡次行仍是 15pt，选中卡盒子与启动前一致。
+			// 布局不变：地址卡次行与启动前同高，选中卡盒子与启动前一致。
+			// 不与写死的 15pt 比：Windows 上文本度量按 96 DPI 设备像素返回，
+			// 12.5pt 的行盒量出来是 16.67px，写死 15 只会在那里假红。与启动
+			// 前的 /loading 次行同高，才是"启动没有改变布局"的真正判据。
 			note := mustFindRect(t, view, launchingNote)
-			if absf(note.H-15) > 0.5 {
-				t.Fatalf("地址卡次行高度被改变了: %+v", note)
+			if absf(note.H-restNote.H) > 0.5 {
+				t.Fatalf("地址卡次行高度被改变了: note=%+v rest=%+v", note, restNote)
 			}
 			if !sameRow(note, restNote) {
 				t.Fatalf("加载文案换了行: note=%+v rest=%+v", note, restNote)
@@ -747,10 +766,23 @@ func TestLaunchingIndicatorIsPainted(t *testing.T) {
 			if card := mustFindRect(t, view, "Identity 1"); !nearlySameRect(card, restCard) {
 				t.Fatalf("启动状态改变了卡片几何: card=%+v rest=%+v", card, restCard)
 			}
+			// 跨平台的同一件事：被交付卡的邮箱文本消失、加载文案恰好两处
+			// （地址卡次行 + 被交付卡副行）。文本存在性与计数不受字体光栅化
+			// 影响，三个平台同一判据。
+			if view.HasText("account1@example.com") {
+				t.Fatalf("启动中被交付卡的邮箱文本仍然存在: %v", view.Texts())
+			}
+			if n := countText(view, launchingNote); n != 2 {
+				t.Fatalf("启动中应当只有地址卡与被交付卡两处加载文案，实际 %d 处: %v", n, view.Texts())
+			}
 			// 选中卡的加载副行在四档外观下都是强调色：opaque 表面（高对比/
-			// 降低透明度/无材质）不能退回与常态同色的小字。
-			if n := accentPixels(view.Image(), restSub); n < 20 {
-				t.Fatalf("选中卡的加载副行没有强调色（强调像素 %d，取样 %+v）", n, restSub)
+			// 降低透明度/无材质）不能退回与常态同色的小字。这条逐像素色相
+			// 判据只在 macOS 上做：Windows 的 ClearType 次像素抗锯齿会给文字
+			// 加彩色边缘，B−R 阈值在那里不成立；macOS 上它仍是颜色回归。
+			if runtime.GOOS == "darwin" {
+				if n := accentPixels(view.Image(), restSub); n < 20 {
+					t.Fatalf("选中卡的加载副行没有强调色（强调像素 %d，取样 %+v）", n, restSub)
+				}
 			}
 			before := append([]byte(nil), view.Image().Pix...)
 			if tc.reduce {
@@ -790,9 +822,8 @@ func TestClickingUnchosenCardLaunchesThatCard(t *testing.T) {
 	// 磨砂上的柔光/流彩；磨砂表面下的强调色由 TestLaunchingIndicatorIsPainted
 	// 覆盖。
 	view.Advance(time.Second)
-	// 指针在列表外时记下两张卡副行的位置（静止槽位几何）：启动只换文字，
-	// 行位置不变，因此这两个盒子在加载帧里仍是同一行。
-	oldSub := mustFindRect(t, view, "account1@example.com")
+	// 指针在列表外时记下被交付卡副行的位置（静止槽位几何）：启动只换文字，
+	// 行位置不变，因此这个盒子在加载帧里仍是同一行。
 	deliveredSub := mustFindRect(t, view, "account2@example.com")
 
 	// 指针先落在第一张卡上（第一帧只登记悬停矩形），再移到第二张：第二次
@@ -831,27 +862,29 @@ func TestClickingUnchosenCardLaunchesThatCard(t *testing.T) {
 	if !app.snapshot().launching {
 		t.Fatal("点击后没有进入启动状态")
 	}
-	// 加载强调必须落在被交付的那张卡上：它的副行是强调色的加载文案，旧的
-	// 选中卡只剩普通邮箱色。两条都是像素断言——无障碍 Label 进不了图像，
-	// 因此"只画了文字节点"的假绿在这里不成立。
-	img := view.Image()
-	if n := accentPixels(img, deliveredSub); n < 20 {
-		t.Fatalf("被交付的卡没有画出加载强调（强调像素 %d，区域 %+v）", n, deliveredSub)
-	}
-	if n := accentPixels(img, oldSub); n != 0 {
-		t.Fatalf("旧的选中卡仍在画加载强调（强调像素 %d，区域 %+v）", n, oldSub)
+	// 加载强调必须落在被交付的那张卡上：它的副行换成强调色的加载文案。
+	// 逐像素色相正判据只在 macOS 上做——Windows 的 ClearType 次像素抗锯齿
+	// 会给文字加彩色边缘，B−R 阈值在那里不成立（旧卡的灰色邮箱副行会被
+	// 误判成强调色）；macOS 上它仍是颜色回归。
+	if runtime.GOOS == "darwin" {
+		if n := accentPixels(view.Image(), deliveredSub); n < 20 {
+			t.Fatalf("被交付的卡没有画出加载强调（强调像素 %d，区域 %+v）", n, deliveredSub)
+		}
 	}
 	if app.chosen != 1 {
 		t.Fatalf("交付的是第二张卡，选中项却停在 %d（loading 会画错卡）", app.chosen)
 	}
-	notes := 0
-	for _, s := range view.Texts() {
-		if s == launchingNote {
-			notes++
-		}
+	// 跨平台的同一件事用文本存在性判据：旧的选中卡仍显示邮箱（它没有进入
+	// loading），被交付卡的邮箱已被加载文案取代，加载文案恰好两处。文本
+	// 存在性不依赖字体光栅化，三个平台同一判据。
+	if !view.HasText("account1@example.com") {
+		t.Fatalf("旧的选中卡丢失了邮箱副行（说明它也在画 loading）: %v", view.Texts())
 	}
-	if notes != 2 {
-		t.Fatalf("启动中应当只有地址卡与被交付卡两处加载文案，实际 %d 处: %v", notes, view.Texts())
+	if view.HasText("account2@example.com") {
+		t.Fatalf("被交付卡的邮箱文本仍然存在（副行没有换成加载文案）: %v", view.Texts())
+	}
+	if n := countText(view, launchingNote); n != 2 {
+		t.Fatalf("启动中应当只有地址卡与被交付卡两处加载文案，实际 %d 处: %v", n, view.Texts())
 	}
 }
 
